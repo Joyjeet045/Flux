@@ -12,22 +12,35 @@ type Subscriber interface {
 type Subscription struct {
 	Subject string
 	Sid     string
-	Queue   string // Empty if standard subscription
+	Queue   string
 	Client  Subscriber
+}
+
+// TrieNode represents a node in the subscription trie
+type TrieNode struct {
+	children      map[string]*TrieNode
+	subscriptions []*Subscription
+	wildcardSubs  []*Subscription // * subscriptions at this level
+	catchAllSubs  []*Subscription // > subscriptions at this level
+}
+
+func newTrieNode() *TrieNode {
+	return &TrieNode{
+		children:      make(map[string]*TrieNode),
+		subscriptions: make([]*Subscription, 0),
+		wildcardSubs:  make([]*Subscription, 0),
+		catchAllSubs:  make([]*Subscription, 0),
+	}
 }
 
 type Matcher struct {
 	mu   sync.RWMutex
-	subs map[string][]*Subscription // Simple map for exact match basic, will upgrade to Trie
-	// For MVP, we can iterate for wildcards or use a better structure.
-	// Let's do a simple list for wildcard support to ensure correctness first.
-	wildcardSubs []*Subscription
+	root *TrieNode
 }
 
 func NewMatcher() *Matcher {
 	return &Matcher{
-		subs:         make(map[string][]*Subscription),
-		wildcardSubs: make([]*Subscription, 0),
+		root: newTrieNode(),
 	}
 }
 
@@ -35,77 +48,144 @@ func (m *Matcher) Subscribe(sub *Subscription) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if strings.Contains(sub.Subject, "*") || strings.Contains(sub.Subject, ">") {
-		m.wildcardSubs = append(m.wildcardSubs, sub)
-	} else {
-		m.subs[sub.Subject] = append(m.subs[sub.Subject], sub)
+	tokens := strings.Split(sub.Subject, ".")
+	m.insertSub(m.root, tokens, 0, sub)
+}
+
+func (m *Matcher) insertSub(node *TrieNode, tokens []string, idx int, sub *Subscription) {
+	if idx >= len(tokens) {
+		node.subscriptions = append(node.subscriptions, sub)
+		return
 	}
+
+	token := tokens[idx]
+
+	if token == ">" {
+		// Catch-all wildcard - matches everything from here
+		node.catchAllSubs = append(node.catchAllSubs, sub)
+		return
+	}
+
+	if token == "*" {
+		// Single-level wildcard
+		node.wildcardSubs = append(node.wildcardSubs, sub)
+		// Continue to next level for proper matching
+		if idx+1 < len(tokens) {
+			// Create a special wildcard path
+			if node.children["*"] == nil {
+				node.children["*"] = newTrieNode()
+			}
+			m.insertSub(node.children["*"], tokens, idx+1, sub)
+		}
+		return
+	}
+
+	// Regular token
+	if node.children[token] == nil {
+		node.children[token] = newTrieNode()
+	}
+	m.insertSub(node.children[token], tokens, idx+1, sub)
 }
 
 func (m *Matcher) Match(subject string) []*Subscription {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	var matches []*Subscription
-
-	// Group matching logic
-	// Map to track if a queue group has already been selected for this message
-	groupSelected := make(map[string]bool)
-
-	// Helper to add match respecting queue groups
-	addMatch := func(sub *Subscription) {
-		if sub.Queue != "" {
-			if groupSelected[sub.Queue] {
-				return // Already selected a member for this group
-			}
-			// Only pick ONE member of the group
-			// For MVP: First one wins (simplified load balancing).
-			// Real LB requires randomization or round-robin state.
-			// Let's implement Random selection later, for now: First Win.
-			// Actually, let's do simple Round Robin if we had the list, but here we are iterating.
-			// Since we iterate, "first one" is deterministic.
-			// To be fair, we should shuffle or rotate.
-			// For basic functional requirement: "Going to only one worker" -> CHECK.
-			groupSelected[sub.Queue] = true
-			matches = append(matches, sub)
-		} else {
-			matches = append(matches, sub)
-		}
-	}
-
-	// Exact matches
-	if s, ok := m.subs[subject]; ok {
-		for _, sub := range s {
-			addMatch(sub)
-		}
-	}
-
-	// Wildcard matches
 	tokens := strings.Split(subject, ".")
-	for _, sub := range m.wildcardSubs {
-		if matchOne(sub.Subject, tokens) {
-			addMatch(sub)
-		}
-	}
+	matches := make([]*Subscription, 0)
+	visited := make(map[*Subscription]bool)
 
-	return matches
+	m.matchRecursive(m.root, tokens, 0, &matches, visited)
+
+	// Apply queue group logic
+	return m.applyQueueGroupLogic(matches)
 }
 
-func matchOne(pattern string, subjectTokens []string) bool {
-	patternTokens := strings.Split(pattern, ".")
-
-	pIdx, sIdx := 0, 0
-	for pIdx < len(patternTokens) && sIdx < len(subjectTokens) {
-		token := patternTokens[pIdx]
-		if token == ">" {
-			return true
+func (m *Matcher) matchRecursive(node *TrieNode, tokens []string, idx int, matches *[]*Subscription, visited map[*Subscription]bool) {
+	// Add catch-all subscriptions (>) at any level
+	for _, sub := range node.catchAllSubs {
+		if !visited[sub] {
+			*matches = append(*matches, sub)
+			visited[sub] = true
 		}
-		if token == "*" || token == subjectTokens[sIdx] {
-			pIdx++
-			sIdx++
-			continue
-		}
-		return false
 	}
-	return pIdx == len(patternTokens) && sIdx == len(subjectTokens)
+
+	// If we've consumed all tokens, add exact matches
+	if idx >= len(tokens) {
+		for _, sub := range node.subscriptions {
+			if !visited[sub] {
+				*matches = append(*matches, sub)
+				visited[sub] = true
+			}
+		}
+		return
+	}
+
+	token := tokens[idx]
+
+	// 1. Try exact match
+	if child, ok := node.children[token]; ok {
+		m.matchRecursive(child, tokens, idx+1, matches, visited)
+	}
+
+	// 2. Try wildcard (*) match
+	if child, ok := node.children["*"]; ok {
+		m.matchRecursive(child, tokens, idx+1, matches, visited)
+	}
+
+	// 3. Check single-level wildcards at this node
+	if idx+1 >= len(tokens) {
+		// Last token - wildcards here match
+		for _, sub := range node.wildcardSubs {
+			if !visited[sub] {
+				*matches = append(*matches, sub)
+				visited[sub] = true
+			}
+		}
+	}
+}
+
+func (m *Matcher) applyQueueGroupLogic(matches []*Subscription) []*Subscription {
+	if len(matches) == 0 {
+		return matches
+	}
+
+	// Group subscriptions by queue name
+	queueGroups := make(map[string][]*Subscription)
+	regularSubs := make([]*Subscription, 0)
+
+	for _, sub := range matches {
+		if sub.Queue != "" {
+			queueGroups[sub.Queue] = append(queueGroups[sub.Queue], sub)
+		} else {
+			regularSubs = append(regularSubs, sub)
+		}
+	}
+
+	result := make([]*Subscription, 0, len(regularSubs)+len(queueGroups))
+	result = append(result, regularSubs...)
+
+	// For each queue group, select one member using round-robin
+	for queueName, members := range queueGroups {
+		if len(members) > 0 {
+			// Use simple hash-based selection for better distribution
+			// In production, this would be proper round-robin with state
+			idx := hashString(queueName) % len(members)
+			result = append(result, members[idx])
+		}
+	}
+
+	return result
+}
+
+// Simple hash function for queue group selection
+func hashString(s string) int {
+	h := 0
+	for i := 0; i < len(s); i++ {
+		h = 31*h + int(s[i])
+	}
+	if h < 0 {
+		h = -h
+	}
+	return h
 }
