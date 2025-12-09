@@ -13,17 +13,14 @@ import (
 	"time"
 )
 
-const (
-	MaxSegmentSize = 10 * 1024 * 1024 // 10MB
-)
-
 type Store struct {
-	mu        sync.RWMutex
-	dir       string
-	segments  []*Segment
-	activeSeg *Segment
-	index     map[uint64]Location
-	nextSeq   uint64
+	mu             sync.RWMutex
+	dir            string
+	segments       []*Segment
+	activeSeg      *Segment
+	index          map[uint64]Location
+	nextSeq        uint64
+	maxSegmentSize int64
 
 	// Retention logic can be added later
 }
@@ -33,15 +30,17 @@ type Location struct {
 	Offset      int64  // Offset in the file
 }
 
-func NewStore(dir string) (*Store, error) {
+func NewStore(dir string, maxSegmentSize int64) (*Store, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
 
 	s := &Store{
-		dir:     dir,
-		index:   make(map[uint64]Location),
-		nextSeq: 1,
+		dir:            dir,
+		segments:       make([]*Segment, 0),
+		index:          make(map[uint64]Location),
+		nextSeq:        1,
+		maxSegmentSize: maxSegmentSize,
 	}
 
 	if err := s.recover(); err != nil {
@@ -128,7 +127,7 @@ func (s *Store) Append(subject string, data []byte) (uint64, error) {
 	defer s.mu.Unlock()
 
 	// Rotation check
-	if s.activeSeg.currentSize >= MaxSegmentSize {
+	if s.activeSeg.currentSize >= s.maxSegmentSize {
 		if err := s.rotate(); err != nil {
 			return 0, err
 		}

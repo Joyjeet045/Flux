@@ -34,14 +34,37 @@ func newTrieNode() *TrieNode {
 }
 
 type Matcher struct {
-	mu   sync.RWMutex
-	root *TrieNode
+	mu       sync.RWMutex
+	root     *TrieNode
+	balancer *QueueGroupBalancer
 }
 
 func NewMatcher() *Matcher {
 	return &Matcher{
-		root: newTrieNode(),
+		root:     newTrieNode(),
+		balancer: NewQueueGroupBalancer(),
 	}
+}
+
+type QueueGroupBalancer struct {
+	mu       sync.Mutex
+	counters map[string]int
+}
+
+func NewQueueGroupBalancer() *QueueGroupBalancer {
+	return &QueueGroupBalancer{
+		counters: make(map[string]int),
+	}
+}
+
+func (qgb *QueueGroupBalancer) SelectMember(queueName string, memberCount int) int {
+	qgb.mu.Lock()
+	defer qgb.mu.Unlock()
+
+	idx := qgb.counters[queueName] % memberCount
+	qgb.counters[queueName]++
+
+	return idx
 }
 
 func (m *Matcher) Subscribe(sub *Subscription) {
@@ -168,24 +191,10 @@ func (m *Matcher) applyQueueGroupLogic(matches []*Subscription) []*Subscription 
 	// For each queue group, select one member using round-robin
 	for queueName, members := range queueGroups {
 		if len(members) > 0 {
-			// Use simple hash-based selection for better distribution
-			// In production, this would be proper round-robin with state
-			idx := hashString(queueName) % len(members)
+			idx := m.balancer.SelectMember(queueName, len(members))
 			result = append(result, members[idx])
 		}
 	}
 
 	return result
-}
-
-// Simple hash function for queue group selection
-func hashString(s string) int {
-	h := 0
-	for i := 0; i < len(s); i++ {
-		h = 31*h + int(s[i])
-	}
-	if h < 0 {
-		h = -h
-	}
-	return h
 }

@@ -4,13 +4,14 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"strconv"
-
 	"nats-lite/internal/ack"
+	"nats-lite/internal/config"
 	"nats-lite/internal/durable"
 	"nats-lite/internal/protocol"
 	"nats-lite/internal/store"
@@ -18,48 +19,87 @@ import (
 )
 
 type Server struct {
-	addr    string
-	matcher *topics.Matcher
-	store   *store.Store
-	ack     *ack.Tracker
-	durable *durable.Store
-	mu      sync.Mutex
-	clients map[*Client]bool
+	addr        string
+	matcher     *topics.Matcher
+	store       *store.Store
+	ack         *ack.Tracker
+	durable     *durable.Store
+	pullCursors *PullCursorStore
+	config      *config.Config
+	mu          sync.Mutex
+	clients     map[*Client]bool
+}
+
+// PullCursorStore tracks pull consumer positions
+type PullCursorStore struct {
+	mu      sync.RWMutex
+	cursors map[string]uint64 // "subject:consumerID" -> last pulled seq
+}
+
+func newPullCursorStore() *PullCursorStore {
+	return &PullCursorStore{
+		cursors: make(map[string]uint64),
+	}
+}
+
+func (pcs *PullCursorStore) Get(subject, consumerID string) uint64 {
+	pcs.mu.RLock()
+	defer pcs.mu.RUnlock()
+	key := subject + ":" + consumerID
+	return pcs.cursors[key]
+}
+
+func (pcs *PullCursorStore) Update(subject, consumerID string, seq uint64) {
+	pcs.mu.Lock()
+	defer pcs.mu.Unlock()
+	key := subject + ":" + consumerID
+	if current, ok := pcs.cursors[key]; !ok || seq > current {
+		pcs.cursors[key] = seq
+	}
 }
 
 type Client struct {
-	conn   net.Conn
-	srv    *Server
-	parser *protocol.Parser
+	conn        net.Conn
+	srv         *Server
+	parser      *protocol.Parser
+	durableSubs map[string]string // sid -> "subject:durableName" for ACK tracking
+	mu          sync.Mutex
 }
 
-func New(addr string, dataDir string) (*Server, error) {
-	st, err := store.NewStore(dataDir)
+func New(cfg *config.Config) (*Server, error) {
+	// Create data directory
+	if err := os.MkdirAll(cfg.Server.DataDir, 0755); err != nil {
+		return nil, err
+	}
+
+	st, err := store.NewStore(cfg.Server.DataDir, cfg.Storage.MaxSegmentSize)
 	if err != nil {
 		return nil, err
 	}
 
-	ds, err := durable.NewStore(dataDir + "/cursors.json")
+	ds, err := durable.NewStore(cfg.Server.DataDir+"/cursors.json", cfg)
 	if err != nil {
 		return nil, err
 	}
 
-	tracker := ack.NewTracker(5*time.Second, 3)
+	ackTimeout, _ := cfg.GetACKTimeout()
+	tracker := ack.NewTracker(ackTimeout, cfg.ACK.MaxRetries)
 
 	srv := &Server{
-		addr:    addr,
-		matcher: topics.NewMatcher(),
-		store:   st,
-		ack:     tracker,
-		durable: ds,
-		clients: make(map[*Client]bool),
+		addr:        cfg.Server.Port,
+		matcher:     topics.NewMatcher(),
+		store:       st,
+		ack:         tracker,
+		durable:     ds,
+		pullCursors: newPullCursorStore(),
+		clients:     make(map[*Client]bool),
+		config:      cfg,
 	}
 
 	// Setup DLQ handler
 	tracker.SetDLQHandler(func(seq uint64, subject string, payload []byte) {
-		dlqSubject := "DLQ." + subject
+		dlqSubject := cfg.DLQ.Prefix + subject
 		log.Printf("Moving message %d to DLQ: %s", seq, dlqSubject)
-		// Re-publish to DLQ topic
 		srv.store.Append(dlqSubject, payload)
 	})
 
@@ -87,12 +127,14 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) retentionLoop() {
-	ticker := time.NewTicker(10 * time.Second) // Check every 10s
+	checkInterval, _ := s.config.GetRetentionCheckInterval()
+	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
 
+	maxAge, _ := s.config.GetRetentionMaxAge()
 	policy := store.RetentionPolicy{
-		MaxAge:   24 * time.Hour,
-		MaxBytes: 1 * 1024 * 1024 * 1024, // 1GB
+		MaxAge:   maxAge,
+		MaxBytes: s.config.Retention.MaxBytes,
 	}
 
 	for range ticker.C {
@@ -102,9 +144,10 @@ func (s *Server) retentionLoop() {
 
 func (s *Server) handleConnection(conn net.Conn) {
 	client := &Client{
-		conn:   conn,
-		srv:    s,
-		parser: protocol.NewParser(conn),
+		conn:        conn,
+		srv:         s,
+		parser:      protocol.NewParser(conn),
+		durableSubs: make(map[string]string),
 	}
 
 	s.mu.Lock()
@@ -138,9 +181,14 @@ func (s *Server) handleConnection(conn net.Conn) {
 		case protocol.ACK:
 			seq, _ := strconv.ParseUint(cmd.Subject, 10, 64)
 			s.ack.Ack(seq)
-			// Update durable cursor if name provided
+			// Update durable cursor if this is a durable subscription
+			// ACK format: ACK <seq> [sid]
 			if cmd.Sid != "" {
-				s.durable.Update(cmd.Sid, seq)
+				client.mu.Lock()
+				if cursorKey, ok := client.durableSubs[cmd.Sid]; ok {
+					s.durable.Update(cursorKey, seq)
+				}
+				client.mu.Unlock()
 			}
 		}
 	}
@@ -187,20 +235,45 @@ func (s *Server) handleSub(c *Client, cmd *protocol.Command) {
 	s.matcher.Subscribe(sub)
 
 	if durableName != "" {
-		// Resume
-		lastSeq := s.durable.Get(durableName) // Keying by Name only (global)
+		// Resume from last acknowledged position
+		// Use composite key: subject + durableName for proper namespacing
+		cursorKey := cmd.Subject + ":" + durableName
+		lastSeq := s.durable.Get(cursorKey)
+
+		// Track this durable subscription for ACK handling
+		c.mu.Lock()
+		c.durableSubs[sub.Sid] = cursorKey
+		c.mu.Unlock()
+
 		if lastSeq > 0 {
-			// Replay from lastSeq+1
-			// This is heavy IO in loop, usually done async
+			// Stream ALL missed messages until caught up
 			go func() {
-				// Naive replay: Read everything store has > lastSeq
-				// Store doesn't have "ReadAfter" yet. We'd read 1 by 1.
-				// Optimization: Store.ReadBatch(startSeq)
-				// For MVP: Just read next 10.
-				for i := 0; i < 10; i++ {
-					rec, err := s.store.Read(lastSeq + 1 + uint64(i))
-					if err == nil {
-						c.Send(sub.Sid, rec.Subject, rec.Data, rec.Sequence)
+				batchSize := s.config.Durable.ReplayBatch
+				currentSeq := lastSeq + 1
+
+				for {
+					req := store.ReplayRequest{
+						Mode:     store.ReplayFromSeq,
+						StartSeq: currentSeq,
+						MaxCount: batchSize,
+					}
+
+					records, err := s.store.ReadBatch(req)
+					if err != nil || len(records) == 0 {
+						break // Caught up or error
+					}
+
+					// Filter by subject and send
+					for _, rec := range records {
+						if rec.Subject == cmd.Subject {
+							c.Send(sub.Sid, rec.Subject, rec.Data, rec.Sequence)
+							currentSeq = rec.Sequence + 1
+						}
+					}
+
+					// If we got less than batch size, we're caught up
+					if len(records) < batchSize {
+						break
 					}
 				}
 			}()
@@ -275,7 +348,8 @@ func (s *Server) handleReplay(c *Client, cmd *protocol.Command) {
 }
 
 func (s *Server) handlePull(c *Client, cmd *protocol.Command) {
-	// PULL <subject> <count>
+	// PULL <subject> <count> [consumerID]
+	// For now, use connection address as consumerID
 	subject := cmd.Subject
 	count, err := strconv.Atoi(cmd.Sid)
 	if err != nil || count <= 0 {
@@ -283,12 +357,16 @@ func (s *Server) handlePull(c *Client, cmd *protocol.Command) {
 		return
 	}
 
-	// For Pull, we need to track consumer position
-	// Simplified: Read last N messages from subject
-	// Real implementation would track per-consumer cursors
+	// Use client connection as unique consumer ID
+	consumerID := c.conn.RemoteAddr().String()
 
+	// Get last pulled position for this consumer
+	lastSeq := s.pullCursors.Get(subject, consumerID)
+
+	// Read from last position + 1
 	req := store.ReplayRequest{
-		Mode:     store.ReplayFromFirst,
+		Mode:     store.ReplayFromSeq,
+		StartSeq: lastSeq + 1,
 		MaxCount: count,
 	}
 
@@ -298,13 +376,22 @@ func (s *Server) handlePull(c *Client, cmd *protocol.Command) {
 		return
 	}
 
-	// Filter by subject
+	// Filter by subject and send
 	sent := 0
+	var maxSeq uint64
 	for _, rec := range records {
 		if rec.Subject == subject {
 			c.Send("pull", rec.Subject, rec.Data, rec.Sequence)
 			sent++
+			if rec.Sequence > maxSeq {
+				maxSeq = rec.Sequence
+			}
 		}
+	}
+
+	// Update cursor to highest sent sequence
+	if maxSeq > 0 {
+		s.pullCursors.Update(subject, consumerID, maxSeq)
 	}
 
 	c.conn.Write([]byte(fmt.Sprintf("+OK %d\r\n", sent)))
@@ -314,4 +401,13 @@ func (c *Client) Send(sid string, subject string, payload []byte, seq uint64) {
 	// MSG <subject> <sid> <size> <seq>\r\n<payload>\r\n
 	msg := fmt.Sprintf("MSG %s %s %d %d\r\n%s\r\n", subject, sid, len(payload), seq, payload)
 	c.conn.Write([]byte(msg))
+}
+
+func (s *Server) Shutdown() error {
+	log.Println("Flushing durable cursors...")
+	s.durable.ForceFlush()
+	s.durable.Close()
+	s.store.Close()
+	log.Println("Shutdown complete")
+	return nil
 }

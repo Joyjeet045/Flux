@@ -1,0 +1,25 @@
+{
+  "server": {
+    "port": ":4223",
+    "data_dir": "data"
+  },
+  "storage": {
+    "max_segment_size": 10485760
+  },
+  "retention": {
+    "max_age": "24h",
+    "max_bytes": 1073741824,
+    "check_interval": "10s"
+  },
+  "ack": {
+    "timeout": "5s",
+    "max_retries": 3
+  },
+  "durable": {
+    "flush_interval": "1s",
+    "replay_batch": 100
+  },
+  "dlq": {
+    "prefix": "DLQ."
+  }
+}

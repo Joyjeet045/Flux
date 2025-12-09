@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func main() {
@@ -41,7 +42,7 @@ func main() {
 		fmt.Println("Published:", *payload)
 	} else if *cmd == "sub" {
 		// Protocol: SUB <subject> [queue] <sid>\r\n
-		sid := "1" // Static SID
+		sid := fmt.Sprintf("cli-%d", time.Now().UnixNano()) // Unique SID
 		msg := ""
 		if *queue != "" {
 			msg = fmt.Sprintf("SUB %s %s %s\r\n", *subject, *queue, sid)
