@@ -20,6 +20,7 @@ const (
 	PONG
 	REPLAY
 	ACK
+	PULL
 )
 
 type Command struct {
@@ -93,11 +94,11 @@ func (p *Parser) Parse() (*Command, error) {
 		if len(parts) < 2 {
 			return nil, fmt.Errorf("invalid REPLAY arguments")
 		}
-		// Parsing sequence could be done here or in server. Let's pass it as Subject or Payload?
-		// Command struct has Subject, Sid, Payload.
-		// "REPLAY <seq>" -> let's put seq in Subject field for simplicity or add specific field.
-		// Using Subject field is fine for string arg.
-		return &Command{Type: REPLAY, Subject: string(parts[1])}, nil
+		// REPLAY <seq>
+		// REPLAY FIRST <count>
+		// REPLAY LAST
+		// REPLAY TIME <unix_timestamp> <count>
+		return &Command{Type: REPLAY, Subject: string(parts[1]), Sid: string(bytes.Join(parts[2:], []byte(" ")))}, nil
 
 	case "ACK":
 		if len(parts) < 2 {
@@ -110,6 +111,13 @@ func (p *Parser) Parse() (*Command, error) {
 			sid = string(parts[2])
 		}
 		return &Command{Type: ACK, Subject: string(parts[1]), Sid: sid}, nil
+
+	case "PULL":
+		if len(parts) < 3 {
+			return nil, fmt.Errorf("invalid PULL arguments")
+		}
+		// PULL <subject> <count>
+		return &Command{Type: PULL, Subject: string(parts[1]), Sid: string(parts[2])}, nil
 	}
 
 	return nil, fmt.Errorf("unknown command: %s", op)

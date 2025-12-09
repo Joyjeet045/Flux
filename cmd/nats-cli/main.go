@@ -106,16 +106,54 @@ func main() {
 			}
 		}
 	} else if *cmd == "replay" {
-		// Protocol: REPLAY <seq>\r\n -> Uses "sub" arg as seq for now
+		// Protocol: REPLAY <seq>\r\n
+		// REPLAY FIRST <count>
+		// REPLAY LAST
+		// REPLAY TIME <timestamp> <count>
 		msg := fmt.Sprintf("REPLAY %s\r\n", *subject)
 		conn.Write([]byte(msg))
 
-		// Read one message (simplification)
+		// Read messages
 		scanner := bufio.NewScanner(conn)
-		if scanner.Scan() {
-			fmt.Println(scanner.Text())
-			if scanner.Scan() {
-				fmt.Println(scanner.Text())
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "MSG") {
+				fmt.Println(line)
+				if scanner.Scan() {
+					fmt.Println(scanner.Text())
+				}
+			} else if strings.HasPrefix(line, "+OK") {
+				fmt.Println("Replay complete")
+				break
+			} else if strings.HasPrefix(line, "-ERR") {
+				fmt.Println(line)
+				break
+			}
+		}
+	} else if *cmd == "pull" {
+		// Protocol: PULL <subject> <count>\r\n
+		count := "10" // Default
+		if *payload != "" {
+			count = *payload
+		}
+		msg := fmt.Sprintf("PULL %s %s\r\n", *subject, count)
+		conn.Write([]byte(msg))
+
+		// Read messages
+		scanner := bufio.NewScanner(conn)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "MSG") {
+				fmt.Println(line)
+				if scanner.Scan() {
+					fmt.Println(scanner.Text())
+				}
+			} else if strings.HasPrefix(line, "+OK") {
+				fmt.Println("Pull complete:", line)
+				break
+			} else if strings.HasPrefix(line, "-ERR") {
+				fmt.Println(line)
+				break
 			}
 		}
 	}

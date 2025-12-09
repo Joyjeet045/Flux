@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,14 +44,26 @@ func New(addr string, dataDir string) (*Server, error) {
 		return nil, err
 	}
 
-	return &Server{
+	tracker := ack.NewTracker(5*time.Second, 3)
+
+	srv := &Server{
 		addr:    addr,
 		matcher: topics.NewMatcher(),
 		store:   st,
-		ack:     ack.NewTracker(5*time.Second, 3), // 5s timeout, 3 retries
+		ack:     tracker,
 		durable: ds,
 		clients: make(map[*Client]bool),
-	}, nil
+	}
+
+	// Setup DLQ handler
+	tracker.SetDLQHandler(func(seq uint64, subject string, payload []byte) {
+		dlqSubject := "DLQ." + subject
+		log.Printf("Moving message %d to DLQ: %s", seq, dlqSubject)
+		// Re-publish to DLQ topic
+		srv.store.Append(dlqSubject, payload)
+	})
+
+	return srv, nil
 }
 
 func (s *Server) Start() error {
@@ -120,6 +133,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 			client.conn.Write([]byte("PONG\r\n"))
 		case protocol.REPLAY:
 			s.handleReplay(client, cmd)
+		case protocol.PULL:
+			s.handlePull(client, cmd)
 		case protocol.ACK:
 			seq, _ := strconv.ParseUint(cmd.Subject, 10, 64)
 			s.ack.Ack(seq)
@@ -197,22 +212,102 @@ func (s *Server) handleSub(c *Client, cmd *protocol.Command) {
 
 func (s *Server) handleReplay(c *Client, cmd *protocol.Command) {
 	// REPLAY <seq>
-	// We cheat and put seq in Subject field for now
-	seq, err := strconv.Atoi(cmd.Subject)
-	if err != nil {
-		return
+	// REPLAY FIRST <count>
+	// REPLAY LAST
+	// REPLAY TIME <unix_timestamp> <count>
+
+	mode := cmd.Subject
+	args := cmd.Sid
+
+	var req store.ReplayRequest
+	req.MaxCount = 100 // Default
+
+	switch mode {
+	case "FIRST":
+		req.Mode = store.ReplayFromFirst
+		if args != "" {
+			if count, err := strconv.Atoi(args); err == nil {
+				req.MaxCount = count
+			}
+		}
+
+	case "LAST":
+		req.Mode = store.ReplayFromLast
+		req.MaxCount = 1
+
+	case "TIME":
+		req.Mode = store.ReplayFromTime
+		parts := strings.Split(args, " ")
+		if len(parts) >= 1 {
+			if ts, err := strconv.ParseInt(parts[0], 10, 64); err == nil {
+				req.StartTime = time.Unix(ts, 0)
+			}
+		}
+		if len(parts) >= 2 {
+			if count, err := strconv.Atoi(parts[1]); err == nil {
+				req.MaxCount = count
+			}
+		}
+
+	default:
+		// Assume it's a sequence number
+		if seq, err := strconv.ParseUint(mode, 10, 64); err == nil {
+			req.Mode = store.ReplayFromSeq
+			req.StartSeq = seq
+			req.MaxCount = 1
+		} else {
+			c.conn.Write([]byte("-ERR invalid replay mode\r\n"))
+			return
+		}
 	}
 
-	rec, err := s.store.Read(uint64(seq))
+	records, err := s.store.ReadBatch(req)
 	if err != nil {
 		c.conn.Write([]byte(fmt.Sprintf("-ERR %v\r\n", err)))
 		return
 	}
 
-	// Send as normal MSG with sid "0" or distinct?
-	// For REPLAY, usually we deliver to a specific subscription.
-	// MVP: Just blast it out as a MSG with sid "replay".
-	c.Send("replay", rec.Subject, rec.Data, rec.Sequence)
+	for _, rec := range records {
+		c.Send("replay", rec.Subject, rec.Data, rec.Sequence)
+	}
+
+	c.conn.Write([]byte("+OK\r\n"))
+}
+
+func (s *Server) handlePull(c *Client, cmd *protocol.Command) {
+	// PULL <subject> <count>
+	subject := cmd.Subject
+	count, err := strconv.Atoi(cmd.Sid)
+	if err != nil || count <= 0 {
+		c.conn.Write([]byte("-ERR invalid count\r\n"))
+		return
+	}
+
+	// For Pull, we need to track consumer position
+	// Simplified: Read last N messages from subject
+	// Real implementation would track per-consumer cursors
+
+	req := store.ReplayRequest{
+		Mode:     store.ReplayFromFirst,
+		MaxCount: count,
+	}
+
+	records, err := s.store.ReadBatch(req)
+	if err != nil {
+		c.conn.Write([]byte(fmt.Sprintf("-ERR %v\r\n", err)))
+		return
+	}
+
+	// Filter by subject
+	sent := 0
+	for _, rec := range records {
+		if rec.Subject == subject {
+			c.Send("pull", rec.Subject, rec.Data, rec.Sequence)
+			sent++
+		}
+	}
+
+	c.conn.Write([]byte(fmt.Sprintf("+OK %d\r\n", sent)))
 }
 
 func (c *Client) Send(sid string, subject string, payload []byte, seq uint64) {

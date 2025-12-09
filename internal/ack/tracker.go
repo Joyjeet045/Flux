@@ -20,10 +20,11 @@ type Resender interface {
 }
 
 type Tracker struct {
-	mu       sync.Mutex
-	pending  map[uint64]*PendingMessage
-	timeout  time.Duration
-	maxRetry int
+	mu         sync.Mutex
+	pending    map[uint64]*PendingMessage
+	timeout    time.Duration
+	maxRetry   int
+	dlqHandler func(seq uint64, subject string, payload []byte)
 }
 
 func NewTracker(timeout time.Duration, maxRetry int) *Tracker {
@@ -34,6 +35,12 @@ func NewTracker(timeout time.Duration, maxRetry int) *Tracker {
 	}
 	go t.loop()
 	return t
+}
+
+func (t *Tracker) SetDLQHandler(handler func(seq uint64, subject string, payload []byte)) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.dlqHandler = handler
 }
 
 func (t *Tracker) Track(seq uint64, client Resender, sid, subject string, payload []byte) {
@@ -71,7 +78,10 @@ func (t *Tracker) checkTimeouts() {
 	for seq, msg := range t.pending {
 		if now.Sub(msg.Timestamp) > t.timeout {
 			if msg.Retries >= t.maxRetry {
-				// DLQ logic would go here
+				// Move to DLQ
+				if t.dlqHandler != nil {
+					t.dlqHandler(seq, msg.Subject, msg.Payload)
+				}
 				delete(t.pending, seq)
 				continue
 			}
