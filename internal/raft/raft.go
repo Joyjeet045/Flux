@@ -69,6 +69,13 @@ func (n *Node) setupRaft() error {
 	// Create sync/async replication mode
 	// Hashicorp raft handles this internally via transport/pipeline, simple config usually fine
 
+	if t, err := time.ParseDuration(n.config.SnapshotInterval); err == nil {
+		c.SnapshotInterval = t
+	}
+	if n.config.SnapshotThreshold > 0 {
+		c.SnapshotThreshold = n.config.SnapshotThreshold
+	}
+
 	// Setup BoltDB store for logs and stable store
 	storePath := filepath.Join(n.dataDir, "raft.db")
 	store, err := raftboltdb.NewBoltStore(storePath)

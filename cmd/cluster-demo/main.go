@@ -87,19 +87,27 @@ func main() {
 	time.Sleep(1 * time.Second)
 
 	// 6. Publish to Node 1
-	log.Println("Publishing to Node 1...")
+	log.Println("Publishing 10 messages to Node 1 to trigger Snapshot...")
 	payload := "Hello Cluster!"
 	pubCmd := fmt.Sprintf("PUB test.topic %d\r\n%s\r\n", len(payload), payload)
-	conn1.Write([]byte(pubCmd))
 
-	time.Sleep(500 * time.Millisecond) // Wait for replication
+	for i := 0; i < 10; i++ {
+		conn1.Write([]byte(pubCmd))
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	time.Sleep(1 * time.Second) // Wait for replication
 
 	// 7. Verify Delivery
 	log.Println("Verifying delivery on Node 2...")
-	verifyMessage(reader2, payload)
+	for i := 0; i < 10; i++ {
+		verifyMessage(reader2, payload)
+	}
 
 	log.Println("Verifying delivery on Node 3...")
-	verifyMessage(reader3, payload)
+	for i := 0; i < 10; i++ {
+		verifyMessage(reader3, payload)
+	}
 
 	log.Println("\n✅ Cluster Demo Successful! Replication works.")
 }

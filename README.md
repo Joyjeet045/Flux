@@ -1,8 +1,8 @@
+![Flux Logo](logo.png)
+
 # Flux
 
 Flux is a high-performance, lightweight, and distributed message broker written in Go. It is designed to provide robust Pub/Sub capabilities, strong persistence, and horizontal scalability through Raft-based clustering. Flux bridges the gap between lightweight queues and heavy enterprise brokers by offering durability and clustering in a compiled, single-binary footprint.
-
-Repository: [https://github.com/Joyjeet045/Flux](https://github.com/Joyjeet045/Flux)
 
 ## Core Features
 
@@ -34,12 +34,15 @@ Repository: [https://github.com/Joyjeet045/Flux](https://github.com/Joyjeet045/F
 *   **Review & Replay**: Clients can request to replay historical data from any point in time or sequence.
 
 ## Architecture Highlights
+
 Flux separates concerns into modular subsystems:
 *   **WAL Store**: Manages segmented log files on disk. Old segments are rotated and pruned based on retention policy.
 *   **Durable Engine**: Persists subscription cursors (Ack offsets) asynchronously, allowing fast recovery on restart.
 *   **Raft FSM**: The Finite State Machine (FSM) applies replicated log entries to the local Store, ensuring all nodes in the cluster eventually hold the exact same data.
+*   **Protocol Layer**: A zero-allocation text parser handles high-throughput command processing.
 
 ## Configuration
+
 Flux is configured via a JSON file. Example `config.json`:
 
 ```json
@@ -64,18 +67,41 @@ Flux is configured via a JSON file. Example `config.json`:
 }
 ```
 
-## Protocol Reference
+## Protocol Overview
+
 Flux uses a line-based text protocol similar to other lightweight brokers.
+
+### Client Commands
 
 | Command | Syntax | Description |
 | :--- | :--- | :--- |
-| **PUB** | `PUB <subject> <len>` | Publish a message payload. |
-| **HPUB** | `HPUB <subj> <hdr_len> <tot_len>` | Publish with headers. |
-| **SUB** | `SUB <subject> <sid>` | Subscribe to a topic. |
+| **PUB** | `PUB <subject> <len>` | Publish a message payload. follows with `\r\n<payload>` |
+| **HPUB** | `HPUB <subj> <hdr_len> <tot_len>` | Publish with headers. Follows with `\r\n<headers><payload>` |
+| **SUB** | `SUB <subject> <sid> [group]` | Subscribe to a topic with a Subscriber ID. |
+| **ACK** | `ACK <seq> [durable_key]` | Acknowledge receipt of a message (for At-Least-Once). |
+| **PULL** | `PULL <subject> <count>` | Request `count` messages (Pull Consumer). |
+| **FLOWCTL** | `FLOWCTL <sid> <mode> [args...]` | Configure flow control. E.g., `PUSH 100 10` or `PULL`. |
+| **STATS** | `STATS [sid]` | Request statistics for a subscriber or the connection. |
+| **PING** | `PING` | Keep-alive check. |
+| **INFO** | `INFO` | Request broker topology and details. |
+| **REPLAY** | `REPLAY <seq\|time> <val>` | Request replay from sequence or timestamp. |
+
+### Server Responses
+
+| Command | Syntax | Description |
+| :--- | :--- | :--- |
 | **MSG** | `MSG <subj> <sid> <len>` | Message pushed to client. |
-| **ACK** | `ACK <seq>` | Acknowledge receipt (for durable subs). |
-| **REPLAY** | `REPLAY <seq|time> <val>` | Request historical replay. |
-| **JOIN** | `JOIN <node_id> <addr>` | Join a cluster (Admin). |
+| **+OK** | `+OK [msg]` | Operation success. |
+| **-ERR** | `-ERR <error_message>` | Operation error (e.g., `-ERR NOT_LEADER`). |
+| **PONG** | `PONG` | Response to PING. |
+| **INFO** | `INFO <json>` | Broker information and topology. |
+
+### Cluster Commands (Admin)
+
+| Command | Syntax | Description |
+| :--- | :--- | :--- |
+| **JOIN** | `JOIN <node_id> <addr>` | Add a new node to the cluster. |
+| **LEAVE** | `LEAVE <node_id>` | Remove a node from the cluster. |
 
 ## Build & Run
 
@@ -92,6 +118,3 @@ go build -o flux ./cmd/server
 # Cluster Node
 ./flux -config node1.json
 ```
-
-## License
-MIT License
