@@ -1,0 +1,53 @@
+{
+    "server": {
+        "port": ":4225",
+        "data_dir": "data/node3"
+    },
+    "storage": {
+        "max_segment_size": 10485760
+    },
+    "retention": {
+        "max_age": "24h",
+        "max_bytes": 1073741824,
+        "check_interval": "10s"
+    },
+    "ack": {
+        "timeout": "5s",
+        "max_retries": 3
+    },
+    "durable": {
+        "flush_interval": "1s",
+        "replay_batch": 100
+    },
+    "dlq": {
+        "prefix": "DLQ."
+    },
+    "flow_control": {
+        "enable_rate_limit": true,
+        "enable_backpressure": true,
+        "default_rate_limit": 1000.0,
+        "default_rate_burst": 100,
+        "default_buffer_size": 1000,
+        "default_slow_threshold": 0.8,
+        "backpressure_mode": "drop"
+    },
+    "deduplication": {
+        "enabled": true,
+        "window_size": "5m",
+        "max_entries": 100000
+    },
+    "cluster": {
+        "enabled": true,
+        "node_id": "node-3",
+        "bind_addr": "127.0.0.1:7003",
+        "advertise_addr": "127.0.0.1:7003",
+        "peers": [],
+        "data_dir": "data/node3/raft",
+        "election_timeout": "3s",
+        "heartbeat_interval": "1s",
+        "snapshot_interval": "1h",
+        "snapshot_threshold": 1000,
+        "replication_mode": "sync",
+        "bootstrap": false
+    }
+}

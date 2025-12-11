@@ -2,6 +2,7 @@ package durable
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -134,5 +135,33 @@ func (s *Store) Close() error {
 // ForceFlush for testing or critical shutdown
 func (s *Store) ForceFlush() error {
 	s.flush()
+	return nil
+}
+
+func (s *Store) Snapshot(w io.Writer) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return json.NewEncoder(w).Encode(s.cursors)
+}
+
+// Restore overwrites the current cursors with state from the reader
+func (s *Store) Restore(r io.Reader) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Reset current state
+	s.cursors = make(map[string]uint64)
+	s.dirty = make(map[string]uint64)
+
+	if err := json.NewDecoder(r).Decode(&s.cursors); err != nil {
+		return err
+	}
+
+	// Mark all as dirty to ensure they get persisted to disk locally eventually
+	// (Though Restore happens on startup or snapshot recovery, usually we want to save immediately)
+	for k, v := range s.cursors {
+		s.dirty[k] = v
+	}
+
 	return nil
 }

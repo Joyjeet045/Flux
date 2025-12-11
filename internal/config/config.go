@@ -15,6 +15,7 @@ type Config struct {
 	DLQ           DLQConfig           `json:"dlq"`
 	FlowControl   FlowControlConfig   `json:"flow_control"`
 	Deduplication DeduplicationConfig `json:"deduplication"`
+	Cluster       ClusterConfig       `json:"cluster"`
 }
 
 type ServerConfig struct {
@@ -62,6 +63,21 @@ type DeduplicationConfig struct {
 	MaxEntries int    `json:"max_entries"` // max messages in dedup window
 }
 
+type ClusterConfig struct {
+	Enabled           bool     `json:"enabled"`
+	NodeID            string   `json:"node_id"`
+	BindAddr          string   `json:"bind_addr"`
+	AdvertiseAddr     string   `json:"advertise_addr"`
+	Peers             []string `json:"peers"`
+	DataDir           string   `json:"data_dir"`
+	ElectionTimeout   string   `json:"election_timeout"`
+	HeartbeatInterval string   `json:"heartbeat_interval"`
+	SnapshotInterval  string   `json:"snapshot_interval"`
+	SnapshotThreshold uint64   `json:"snapshot_threshold"`
+	ReplicationMode   string   `json:"replication_mode"`
+	Bootstrap         bool     `json:"bootstrap"`
+}
+
 // Default returns a config with sensible defaults
 func Default() *Config {
 	return &Config{
@@ -101,6 +117,19 @@ func Default() *Config {
 			Enabled:    true,
 			WindowSize: "5m",
 			MaxEntries: 100000,
+		},
+		Cluster: ClusterConfig{
+			Enabled:           false,
+			NodeID:            "node-1",
+			BindAddr:          "127.0.0.1:4224",
+			AdvertiseAddr:     "127.0.0.1:4224",
+			DataDir:           "data/raft",
+			ElectionTimeout:   "1s",
+			HeartbeatInterval: "100ms",
+			SnapshotInterval:  "1h",
+			SnapshotThreshold: 1000,
+			ReplicationMode:   "sync",
+			Bootstrap:         false,
 		},
 	}
 }

@@ -25,6 +25,9 @@ const (
 	PULL
 	FLOWCTL
 	STATS
+	JOIN
+	LEAVE
+	INFO
 )
 
 type Command struct {
@@ -184,6 +187,23 @@ func (p *Parser) Parse() (*Command, error) {
 			sid = string(parts[1])
 		}
 		return &Command{Type: STATS, Sid: sid}, nil
+
+	case "JOIN":
+		// JOIN <nodeID> <addr>
+		if len(parts) < 3 {
+			return nil, fmt.Errorf("invalid JOIN arguments")
+		}
+		return &Command{Type: JOIN, Subject: string(parts[1]), Sid: string(parts[2])}, nil
+
+	case "LEAVE":
+		// LEAVE <nodeID>
+		if len(parts) < 2 {
+			return nil, fmt.Errorf("invalid LEAVE arguments")
+		}
+		return &Command{Type: LEAVE, Subject: string(parts[1])}, nil
+
+	case "INFO":
+		return &Command{Type: INFO}, nil
 	}
 
 	return nil, fmt.Errorf("unknown command: %s", op)

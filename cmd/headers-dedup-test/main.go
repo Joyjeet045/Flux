@@ -10,7 +10,7 @@ import (
 )
 
 func main() {
-	log.Println("=== Headers & Deduplication Integration Test ===\n")
+	log.Println("=== Headers & Deduplication Integration Test ===")
 
 	conn, err := net.Dial("tcp", "localhost:4223")
 	if err != nil {
@@ -19,7 +19,7 @@ func main() {
 	defer conn.Close()
 
 	reader := bufio.NewReader(conn)
-	log.Println("✓ Connected to NATS-Lite server\n")
+	log.Println("✓ Connected to NATS-Lite server")
 
 	log.Println("--- Test 1: Publish with Headers (HPUB) ---")
 	headers := "Msg-ID: test-msg-001\r\nTrace-ID: trace-123\r\nUser-ID: user-456\r\n\r\n"

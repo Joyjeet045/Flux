@@ -12,12 +12,14 @@ import (
 	"time"
 
 	"nats-lite/internal/ack"
+	"nats-lite/internal/cluster"
 	"nats-lite/internal/config"
 	"nats-lite/internal/dedup"
 	"nats-lite/internal/durable"
 	"nats-lite/internal/flowcontrol"
 	"nats-lite/internal/headers"
 	"nats-lite/internal/protocol"
+	internalraft "nats-lite/internal/raft"
 	"nats-lite/internal/store"
 	"nats-lite/internal/topics"
 )
@@ -30,6 +32,7 @@ type Server struct {
 	durable     *durable.Store
 	pullCursors *PullCursorStore
 	dedup       *dedup.Deduplicator
+	cluster     *cluster.Manager
 	config      *config.Config
 	mu          sync.Mutex
 	clients     map[*Client]bool
@@ -116,6 +119,16 @@ func New(cfg *config.Config) (*Server, error) {
 		log.Printf("Deduplication enabled: window=%v, max_entries=%d", windowSize, cfg.Deduplication.MaxEntries)
 	}
 
+	var clusterMgr *cluster.Manager
+	if cfg.Cluster.Enabled {
+		cm, err := cluster.NewManager(&cfg.Cluster, st, ds)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize cluster manager: %v", err)
+		}
+		clusterMgr = cm
+		log.Printf("Clustering enabled: node=%s addr=%s", cfg.Cluster.NodeID, cfg.Cluster.BindAddr)
+	}
+
 	srv := &Server{
 		addr:        cfg.Server.Port,
 		matcher:     topics.NewMatcher(),
@@ -124,8 +137,25 @@ func New(cfg *config.Config) (*Server, error) {
 		durable:     ds,
 		pullCursors: newPullCursorStore(),
 		dedup:       deduplicator,
+		cluster:     clusterMgr,
 		clients:     make(map[*Client]bool),
 		config:      cfg,
+	}
+
+	if clusterMgr != nil {
+		clusterMgr.SetOnApply(func(cmd *internalraft.LogCommand, seq uint64) {
+			log.Printf("FSM OnApply [Node %s]: Type=%s Subject=%s Seq=%d", cfg.Cluster.NodeID, cmd.Type, cmd.Subject, seq)
+			if cmd.Type == internalraft.CmdPublish {
+				// subs := srv.matcher.Match(cmd.Subject)
+				// log.Printf("Cluster Apply [Node %s]: %s (Seq %d)", cfg.Cluster.NodeID, cmd.Subject, seq)
+				subs := srv.matcher.Match(cmd.Subject)
+				log.Printf("Matched %d subs for %s", len(subs), cmd.Subject)
+				for _, sub := range subs {
+					srv.ack.Track(seq, sub.Client, sub.Sid, cmd.Subject, cmd.Data)
+					sub.Client.Send(sub.Sid, cmd.Subject, cmd.Data, seq)
+				}
+			}
+		})
 	}
 
 	tracker.SetDLQHandler(func(seq uint64, subject string, payload []byte) {
@@ -206,7 +236,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 		switch cmd.Type {
 		case protocol.PUB:
-			s.handlePub(cmd)
+			s.handlePub(client, cmd)
+		case protocol.HPUB:
+			s.handlePub(client, cmd)
 		case protocol.SUB:
 			s.handleSub(client, cmd)
 		case protocol.PING:
@@ -219,6 +251,12 @@ func (s *Server) handleConnection(conn net.Conn) {
 			s.handleFlowControl(client, cmd)
 		case protocol.STATS:
 			s.handleStats(client, cmd)
+		case protocol.JOIN:
+			s.handleJoin(client, cmd)
+		case protocol.LEAVE:
+			s.handleLeave(client, cmd)
+		case protocol.INFO:
+			s.handleInfo(client, cmd)
 		case protocol.ACK:
 			seq, _ := strconv.ParseUint(cmd.Subject, 10, 64)
 			s.ack.Ack(seq)
@@ -233,7 +271,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 }
 
-func (s *Server) handlePub(cmd *protocol.Command) {
+func (s *Server) handlePub(client *Client, cmd *protocol.Command) {
 	if cmd.Headers == nil {
 		cmd.Headers = headers.New()
 	}
@@ -246,14 +284,47 @@ func (s *Server) handlePub(cmd *protocol.Command) {
 		msgID := cmd.Headers.Get(headers.MessageID)
 		if s.dedup.IsDuplicate(msgID) {
 			log.Printf("Duplicate message detected: %s", msgID)
+			client.conn.Write([]byte("+OK DUP\r\n")) // Optional: Inform client it was dup
 			return
 		}
 	}
 
-	seq, err := s.store.AppendWithHeaders(cmd.Subject, cmd.Headers, cmd.Payload)
-	if err != nil {
-		log.Println("Storage error:", err)
+	var seq uint64
+	var err error
+
+	if s.cluster != nil && s.cluster.IsLeader() {
+		// Cluster mode (Leader): Replicate via Raft
+		cmd := &internalraft.LogCommand{
+			Type:    internalraft.CmdPublish,
+			Subject: cmd.Subject,
+			Data:    cmd.Payload,
+			Headers: cmd.Headers,
+		}
+		result, err := s.cluster.Apply(cmd)
+		if err != nil {
+			log.Printf("Cluster apply error: %v", err)
+			client.conn.Write([]byte(fmt.Sprintf("-ERR CLUSTER_APPLY %v\r\n", err)))
+			return
+		}
+		seq = result.(uint64)
+	} else if s.cluster != nil {
+		// Cluster mode (Follower): Redirect to leader
+		leader := s.cluster.GetLeader()
+		// TODO: We only know raft address. Ideally client should rediscover.
+		client.conn.Write([]byte(fmt.Sprintf("-ERR NOT_LEADER leader=%s\r\n", leader)))
+		return
+	} else {
+		// Standalone mode: Write to local store
+		seq, err = s.store.AppendWithHeaders(cmd.Subject, cmd.Headers, cmd.Payload)
+		if err != nil {
+			log.Println("Storage error:", err)
+			client.conn.Write([]byte(fmt.Sprintf("-ERR STORAGE %v\r\n", err)))
+			return
+		}
 	}
+
+	// Send ack to publisher if needed (simple +OK)
+	client.conn.Write([]byte("+OK\r\n"))
 
 	subs := s.matcher.Match(cmd.Subject)
 	for _, sub := range subs {
@@ -530,6 +601,9 @@ func (s *Server) Shutdown() error {
 	log.Println("Flushing durable cursors...")
 	s.durable.ForceFlush()
 	s.durable.Close()
+	if s.cluster != nil {
+		s.cluster.Shutdown()
+	}
 	s.store.Close()
 	log.Println("Shutdown complete")
 	return nil
