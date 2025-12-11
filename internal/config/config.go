@@ -7,12 +7,13 @@ import (
 )
 
 type Config struct {
-	Server    ServerConfig    `json:"server"`
-	Storage   StorageConfig   `json:"storage"`
-	Retention RetentionConfig `json:"retention"`
-	ACK       ACKConfig       `json:"ack"`
-	Durable   DurableConfig   `json:"durable"`
-	DLQ       DLQConfig       `json:"dlq"`
+	Server      ServerConfig      `json:"server"`
+	Storage     StorageConfig     `json:"storage"`
+	Retention   RetentionConfig   `json:"retention"`
+	ACK         ACKConfig         `json:"ack"`
+	Durable     DurableConfig     `json:"durable"`
+	DLQ         DLQConfig         `json:"dlq"`
+	FlowControl FlowControlConfig `json:"flow_control"`
 }
 
 type ServerConfig struct {
@@ -44,6 +45,16 @@ type DLQConfig struct {
 	Prefix string `json:"prefix"` // e.g., "DLQ."
 }
 
+type FlowControlConfig struct {
+	EnableRateLimit      bool    `json:"enable_rate_limit"`
+	EnableBackpressure   bool    `json:"enable_backpressure"`
+	DefaultRateLimit     float64 `json:"default_rate_limit"`     // messages per second
+	DefaultRateBurst     int     `json:"default_rate_burst"`     // burst capacity
+	DefaultBufferSize    int     `json:"default_buffer_size"`    // buffer size per consumer
+	DefaultSlowThreshold float64 `json:"default_slow_threshold"` // 0.0-1.0, buffer usage threshold
+	BackpressureMode     string  `json:"backpressure_mode"`      // "drop", "block", "shed"
+}
+
 // Default returns a config with sensible defaults
 func Default() *Config {
 	return &Config{
@@ -69,6 +80,15 @@ func Default() *Config {
 		},
 		DLQ: DLQConfig{
 			Prefix: "DLQ.",
+		},
+		FlowControl: FlowControlConfig{
+			EnableRateLimit:      true,
+			EnableBackpressure:   true,
+			DefaultRateLimit:     1000.0,
+			DefaultRateBurst:     100,
+			DefaultBufferSize:    1000,
+			DefaultSlowThreshold: 0.8,
+			BackpressureMode:     "drop",
 		},
 	}
 }

@@ -21,6 +21,8 @@ const (
 	REPLAY
 	ACK
 	PULL
+	FLOWCTL
+	STATS
 )
 
 type Command struct {
@@ -118,6 +120,23 @@ func (p *Parser) Parse() (*Command, error) {
 		}
 		// PULL <subject> <count>
 		return &Command{Type: PULL, Subject: string(parts[1]), Sid: string(parts[2])}, nil
+
+	case "FLOWCTL":
+		if len(parts) < 2 {
+			return nil, fmt.Errorf("invalid FLOWCTL arguments")
+		}
+		// FLOWCTL <sid> <mode> [rate] [burst] [buffer]
+		// FLOWCTL sub1 PUSH 100 10 1000
+		// FLOWCTL sub1 PULL 0 0 500
+		return &Command{Type: FLOWCTL, Subject: string(parts[1]), Sid: string(bytes.Join(parts[2:], []byte(" ")))}, nil
+
+	case "STATS":
+		// STATS [sid]
+		sid := ""
+		if len(parts) > 1 {
+			sid = string(parts[1])
+		}
+		return &Command{Type: STATS, Sid: sid}, nil
 	}
 
 	return nil, fmt.Errorf("unknown command: %s", op)

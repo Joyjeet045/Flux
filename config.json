@@ -21,5 +21,14 @@
   },
   "dlq": {
     "prefix": "DLQ."
+  },
+  "flow_control": {
+    "enable_rate_limit": true,
+    "enable_backpressure": true,
+    "default_rate_limit": 1000.0,
+    "default_rate_burst": 100,
+    "default_buffer_size": 1000,
+    "default_slow_threshold": 0.8,
+    "backpressure_mode": "drop"
   }
 }

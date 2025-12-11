@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"nats-lite/internal/ack"
 	"nats-lite/internal/config"
 	"nats-lite/internal/durable"
+	"nats-lite/internal/flowcontrol"
 	"nats-lite/internal/protocol"
 	"nats-lite/internal/store"
 	"nats-lite/internal/topics"
@@ -30,10 +32,9 @@ type Server struct {
 	clients     map[*Client]bool
 }
 
-// PullCursorStore tracks pull consumer positions
 type PullCursorStore struct {
 	mu      sync.RWMutex
-	cursors map[string]uint64 // "subject:consumerID" -> last pulled seq
+	cursors map[string]uint64
 }
 
 func newPullCursorStore() *PullCursorStore {
@@ -59,15 +60,35 @@ func (pcs *PullCursorStore) Update(subject, consumerID string, seq uint64) {
 }
 
 type Client struct {
-	conn        net.Conn
-	srv         *Server
-	parser      *protocol.Parser
-	durableSubs map[string]string // sid -> "subject:durableName" for ACK tracking
-	mu          sync.Mutex
+	conn            net.Conn
+	srv             *Server
+	parser          *protocol.Parser
+	durableSubs     map[string]string
+	flowControllers map[string]*flowcontrol.FlowControlledConsumer
+	mu              sync.Mutex
+}
+
+func (c *Client) Send(sid string, subject string, payload []byte, seq uint64) {
+	c.mu.Lock()
+	fc, hasFC := c.flowControllers[sid]
+	c.mu.Unlock()
+
+	if hasFC {
+		msg := flowcontrol.Message{
+			Sid:      sid,
+			Subject:  subject,
+			Payload:  payload,
+			Sequence: seq,
+		}
+		fc.Publish(msg)
+		return
+	}
+
+	msg := fmt.Sprintf("MSG %s %s %d %d\r\n%s\r\n", subject, sid, len(payload), seq, payload)
+	c.conn.Write([]byte(msg))
 }
 
 func New(cfg *config.Config) (*Server, error) {
-	// Create data directory
 	if err := os.MkdirAll(cfg.Server.DataDir, 0755); err != nil {
 		return nil, err
 	}
@@ -96,7 +117,6 @@ func New(cfg *config.Config) (*Server, error) {
 		config:      cfg,
 	}
 
-	// Setup DLQ handler
 	tracker.SetDLQHandler(func(seq uint64, subject string, payload []byte) {
 		dlqSubject := cfg.DLQ.Prefix + subject
 		log.Printf("Moving message %d to DLQ: %s", seq, dlqSubject)
@@ -113,7 +133,6 @@ func (s *Server) Start() error {
 	}
 	log.Printf("Listening on %s", s.addr)
 
-	// Start Retention Loop
 	go s.retentionLoop()
 
 	for {
@@ -144,10 +163,11 @@ func (s *Server) retentionLoop() {
 
 func (s *Server) handleConnection(conn net.Conn) {
 	client := &Client{
-		conn:        conn,
-		srv:         s,
-		parser:      protocol.NewParser(conn),
-		durableSubs: make(map[string]string),
+		conn:            conn,
+		srv:             s,
+		parser:          protocol.NewParser(conn),
+		durableSubs:     make(map[string]string),
+		flowControllers: make(map[string]*flowcontrol.FlowControlledConsumer),
 	}
 
 	s.mu.Lock()
@@ -155,6 +175,12 @@ func (s *Server) handleConnection(conn net.Conn) {
 	s.mu.Unlock()
 
 	defer func() {
+		client.mu.Lock()
+		for _, fc := range client.flowControllers {
+			fc.Close()
+		}
+		client.mu.Unlock()
+
 		s.mu.Lock()
 		delete(s.clients, client)
 		s.mu.Unlock()
@@ -178,11 +204,13 @@ func (s *Server) handleConnection(conn net.Conn) {
 			s.handleReplay(client, cmd)
 		case protocol.PULL:
 			s.handlePull(client, cmd)
+		case protocol.FLOWCTL:
+			s.handleFlowControl(client, cmd)
+		case protocol.STATS:
+			s.handleStats(client, cmd)
 		case protocol.ACK:
 			seq, _ := strconv.ParseUint(cmd.Subject, 10, 64)
 			s.ack.Ack(seq)
-			// Update durable cursor if this is a durable subscription
-			// ACK format: ACK <seq> [sid]
 			if cmd.Sid != "" {
 				client.mu.Lock()
 				if cursorKey, ok := client.durableSubs[cmd.Sid]; ok {
@@ -195,35 +223,28 @@ func (s *Server) handleConnection(conn net.Conn) {
 }
 
 func (s *Server) handlePub(cmd *protocol.Command) {
-	// Persist
 	seq, err := s.store.Append(cmd.Subject, cmd.Payload)
 	if err != nil {
 		log.Println("Storage error:", err)
 	}
 
-	// Match and Dispach
 	subs := s.matcher.Match(cmd.Subject)
 	for _, sub := range subs {
-		// Track for retry
 		s.ack.Track(seq, sub.Client, sub.Sid, cmd.Subject, cmd.Payload)
 		sub.Client.Send(sub.Sid, cmd.Subject, cmd.Payload, seq)
 	}
 }
 
 func (s *Server) handleSub(c *Client, cmd *protocol.Command) {
-	// If Queue group is present, it's in Payload from parser hack
 	queue := ""
 	if len(cmd.Payload) > 0 {
 		queue = string(cmd.Payload)
 	}
 
-	// Check for Durable Replay
-	// Hack: if Queue starts with "DURABLE:", treat as durable name
-	// This is Protocol V0.2 Hack
 	durableName := ""
 	if len(queue) > 8 && queue[:8] == "DURABLE:" {
 		durableName = queue[8:]
-		queue = "" // It's not a queue group then
+		queue = ""
 	}
 
 	sub := &topics.Subscription{
@@ -234,19 +255,26 @@ func (s *Server) handleSub(c *Client, cmd *protocol.Command) {
 	}
 	s.matcher.Subscribe(sub)
 
+	c.mu.Lock()
+	if _, exists := c.flowControllers[cmd.Sid]; !exists {
+		fcConfig := s.getDefaultFlowControlConfig()
+		c.flowControllers[cmd.Sid] = flowcontrol.NewFlowControlledConsumer(
+			cmd.Sid,
+			fcConfig,
+			c,
+		)
+	}
+	c.mu.Unlock()
+
 	if durableName != "" {
-		// Resume from last acknowledged position
-		// Use composite key: subject + durableName for proper namespacing
 		cursorKey := cmd.Subject + ":" + durableName
 		lastSeq := s.durable.Get(cursorKey)
 
-		// Track this durable subscription for ACK handling
 		c.mu.Lock()
 		c.durableSubs[sub.Sid] = cursorKey
 		c.mu.Unlock()
 
 		if lastSeq > 0 {
-			// Stream ALL missed messages until caught up
 			go func() {
 				batchSize := s.config.Durable.ReplayBatch
 				currentSeq := lastSeq + 1
@@ -260,10 +288,9 @@ func (s *Server) handleSub(c *Client, cmd *protocol.Command) {
 
 					records, err := s.store.ReadBatch(req)
 					if err != nil || len(records) == 0 {
-						break // Caught up or error
+						break
 					}
 
-					// Filter by subject and send
 					for _, rec := range records {
 						if rec.Subject == cmd.Subject {
 							c.Send(sub.Sid, rec.Subject, rec.Data, rec.Sequence)
@@ -271,7 +298,6 @@ func (s *Server) handleSub(c *Client, cmd *protocol.Command) {
 						}
 					}
 
-					// If we got less than batch size, we're caught up
 					if len(records) < batchSize {
 						break
 					}
@@ -284,16 +310,11 @@ func (s *Server) handleSub(c *Client, cmd *protocol.Command) {
 }
 
 func (s *Server) handleReplay(c *Client, cmd *protocol.Command) {
-	// REPLAY <seq>
-	// REPLAY FIRST <count>
-	// REPLAY LAST
-	// REPLAY TIME <unix_timestamp> <count>
-
 	mode := cmd.Subject
 	args := cmd.Sid
 
 	var req store.ReplayRequest
-	req.MaxCount = 100 // Default
+	req.MaxCount = 100
 
 	switch mode {
 	case "FIRST":
@@ -323,7 +344,6 @@ func (s *Server) handleReplay(c *Client, cmd *protocol.Command) {
 		}
 
 	default:
-		// Assume it's a sequence number
 		if seq, err := strconv.ParseUint(mode, 10, 64); err == nil {
 			req.Mode = store.ReplayFromSeq
 			req.StartSeq = seq
@@ -348,8 +368,6 @@ func (s *Server) handleReplay(c *Client, cmd *protocol.Command) {
 }
 
 func (s *Server) handlePull(c *Client, cmd *protocol.Command) {
-	// PULL <subject> <count> [consumerID]
-	// For now, use connection address as consumerID
 	subject := cmd.Subject
 	count, err := strconv.Atoi(cmd.Sid)
 	if err != nil || count <= 0 {
@@ -357,13 +375,9 @@ func (s *Server) handlePull(c *Client, cmd *protocol.Command) {
 		return
 	}
 
-	// Use client connection as unique consumer ID
 	consumerID := c.conn.RemoteAddr().String()
-
-	// Get last pulled position for this consumer
 	lastSeq := s.pullCursors.Get(subject, consumerID)
 
-	// Read from last position + 1
 	req := store.ReplayRequest{
 		Mode:     store.ReplayFromSeq,
 		StartSeq: lastSeq + 1,
@@ -376,7 +390,6 @@ func (s *Server) handlePull(c *Client, cmd *protocol.Command) {
 		return
 	}
 
-	// Filter by subject and send
 	sent := 0
 	var maxSeq uint64
 	for _, rec := range records {
@@ -389,7 +402,6 @@ func (s *Server) handlePull(c *Client, cmd *protocol.Command) {
 		}
 	}
 
-	// Update cursor to highest sent sequence
 	if maxSeq > 0 {
 		s.pullCursors.Update(subject, consumerID, maxSeq)
 	}
@@ -397,10 +409,94 @@ func (s *Server) handlePull(c *Client, cmd *protocol.Command) {
 	c.conn.Write([]byte(fmt.Sprintf("+OK %d\r\n", sent)))
 }
 
-func (c *Client) Send(sid string, subject string, payload []byte, seq uint64) {
-	// MSG <subject> <sid> <size> <seq>\r\n<payload>\r\n
-	msg := fmt.Sprintf("MSG %s %s %d %d\r\n%s\r\n", subject, sid, len(payload), seq, payload)
-	c.conn.Write([]byte(msg))
+func (s *Server) handleFlowControl(c *Client, cmd *protocol.Command) {
+	sid := cmd.Subject
+	args := strings.Fields(cmd.Sid)
+
+	if len(args) < 1 {
+		c.conn.Write([]byte("-ERR invalid FLOWCTL arguments\r\n"))
+		return
+	}
+
+	mode := strings.ToUpper(args[0])
+
+	fcConfig := s.getDefaultFlowControlConfig()
+
+	if mode == "PUSH" {
+		fcConfig.Mode = flowcontrol.PushMode
+	} else if mode == "PULL" {
+		fcConfig.Mode = flowcontrol.PullMode
+	} else {
+		c.conn.Write([]byte("-ERR invalid mode (PUSH or PULL)\r\n"))
+		return
+	}
+
+	if len(args) > 1 {
+		if rate, err := strconv.ParseFloat(args[1], 64); err == nil && rate > 0 {
+			fcConfig.RateLimit = rate
+		}
+	}
+	if len(args) > 2 {
+		if burst, err := strconv.Atoi(args[2]); err == nil && burst > 0 {
+			fcConfig.RateBurst = burst
+		}
+	}
+	if len(args) > 3 {
+		if bufSize, err := strconv.Atoi(args[3]); err == nil && bufSize > 0 {
+			fcConfig.BufferSize = bufSize
+		}
+	}
+
+	c.mu.Lock()
+	if oldFC, exists := c.flowControllers[sid]; exists {
+		oldFC.Close()
+	}
+	c.flowControllers[sid] = flowcontrol.NewFlowControlledConsumer(sid, fcConfig, c)
+	c.mu.Unlock()
+
+	c.conn.Write([]byte(fmt.Sprintf("+OK mode=%s rate=%.0f burst=%d buffer=%d\r\n",
+		mode, fcConfig.RateLimit, fcConfig.RateBurst, fcConfig.BufferSize)))
+}
+
+func (s *Server) handleStats(c *Client, cmd *protocol.Command) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	stats := make(map[string]interface{})
+
+	if cmd.Sid == "" {
+		for sid, fc := range c.flowControllers {
+			stats[sid] = fc.Stats()
+		}
+	} else {
+		if fc, exists := c.flowControllers[cmd.Sid]; exists {
+			stats[cmd.Sid] = fc.Stats()
+		}
+	}
+
+	jsonData, _ := json.Marshal(stats)
+	c.conn.Write([]byte(fmt.Sprintf("+STATS %s\r\n", jsonData)))
+}
+
+func (s *Server) getDefaultFlowControlConfig() flowcontrol.ConsumerConfig {
+	bpMode := flowcontrol.ModeDrop
+	switch s.config.FlowControl.BackpressureMode {
+	case "block":
+		bpMode = flowcontrol.ModeBlock
+	case "shed":
+		bpMode = flowcontrol.ModeShed
+	}
+
+	return flowcontrol.ConsumerConfig{
+		Mode:               flowcontrol.PushMode,
+		RateLimit:          s.config.FlowControl.DefaultRateLimit,
+		RateBurst:          s.config.FlowControl.DefaultRateBurst,
+		BufferSize:         s.config.FlowControl.DefaultBufferSize,
+		BackpressureMode:   bpMode,
+		SlowThreshold:      s.config.FlowControl.DefaultSlowThreshold,
+		EnableRateLimit:    s.config.FlowControl.EnableRateLimit,
+		EnableBackpressure: s.config.FlowControl.EnableBackpressure,
+	}
 }
 
 func (s *Server) Shutdown() error {
