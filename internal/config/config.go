@@ -7,13 +7,14 @@ import (
 )
 
 type Config struct {
-	Server      ServerConfig      `json:"server"`
-	Storage     StorageConfig     `json:"storage"`
-	Retention   RetentionConfig   `json:"retention"`
-	ACK         ACKConfig         `json:"ack"`
-	Durable     DurableConfig     `json:"durable"`
-	DLQ         DLQConfig         `json:"dlq"`
-	FlowControl FlowControlConfig `json:"flow_control"`
+	Server        ServerConfig        `json:"server"`
+	Storage       StorageConfig       `json:"storage"`
+	Retention     RetentionConfig     `json:"retention"`
+	ACK           ACKConfig           `json:"ack"`
+	Durable       DurableConfig       `json:"durable"`
+	DLQ           DLQConfig           `json:"dlq"`
+	FlowControl   FlowControlConfig   `json:"flow_control"`
+	Deduplication DeduplicationConfig `json:"deduplication"`
 }
 
 type ServerConfig struct {
@@ -55,6 +56,12 @@ type FlowControlConfig struct {
 	BackpressureMode     string  `json:"backpressure_mode"`      // "drop", "block", "shed"
 }
 
+type DeduplicationConfig struct {
+	Enabled    bool   `json:"enabled"`
+	WindowSize string `json:"window_size"` // duration string: "5m"
+	MaxEntries int    `json:"max_entries"` // max messages in dedup window
+}
+
 // Default returns a config with sensible defaults
 func Default() *Config {
 	return &Config{
@@ -89,6 +96,11 @@ func Default() *Config {
 			DefaultBufferSize:    1000,
 			DefaultSlowThreshold: 0.8,
 			BackpressureMode:     "drop",
+		},
+		Deduplication: DeduplicationConfig{
+			Enabled:    true,
+			WindowSize: "5m",
+			MaxEntries: 100000,
 		},
 	}
 }
@@ -137,4 +149,8 @@ func (c *Config) GetACKTimeout() (time.Duration, error) {
 
 func (c *Config) GetDurableFlushInterval() (time.Duration, error) {
 	return time.ParseDuration(c.Durable.FlushInterval)
+}
+
+func (c *Config) GetDeduplicationWindowSize() (time.Duration, error) {
+	return time.ParseDuration(c.Deduplication.WindowSize)
 }

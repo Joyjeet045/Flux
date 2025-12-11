@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"nats-lite/internal/headers"
 	"strconv"
 )
 
@@ -12,6 +13,7 @@ type CommandType int
 
 const (
 	PUB CommandType = iota
+	HPUB
 	SUB
 	MSG
 	OK
@@ -29,6 +31,7 @@ type Command struct {
 	Type    CommandType
 	Subject string
 	Sid     string
+	Headers headers.Headers
 	Payload []byte
 }
 
@@ -73,6 +76,50 @@ func (p *Parser) Parse() (*Command, error) {
 		p.reader.ReadBytes('\n')
 
 		return &Command{Type: PUB, Subject: subject, Payload: payload}, nil
+
+	case "HPUB":
+		// HPUB <subject> <header_size> <total_size>
+		if len(parts) < 4 {
+			return nil, fmt.Errorf("invalid HPUB arguments")
+		}
+		subject := string(parts[1])
+		headerSize, err := strconv.Atoi(string(parts[2]))
+		if err != nil {
+			return nil, fmt.Errorf("invalid header size")
+		}
+		totalSize, err := strconv.Atoi(string(parts[3]))
+		if err != nil {
+			return nil, fmt.Errorf("invalid total size")
+		}
+
+		// Read headers
+		var hdrs headers.Headers
+		if headerSize > 0 {
+			headerBytes := make([]byte, headerSize)
+			_, err = io.ReadFull(p.reader, headerBytes)
+			if err != nil {
+				return nil, err
+			}
+			hdrs, err = headers.Decode(headerBytes)
+			if err != nil {
+				return nil, fmt.Errorf("invalid headers: %v", err)
+			}
+		}
+
+		// Read payload
+		payloadSize := totalSize - headerSize
+		payload := make([]byte, payloadSize)
+		if payloadSize > 0 {
+			_, err = io.ReadFull(p.reader, payload)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// Read trailing \r\n
+		p.reader.ReadBytes('\n')
+
+		return &Command{Type: HPUB, Subject: subject, Headers: hdrs, Payload: payload}, nil
 
 	case "SUB":
 		if len(parts) < 3 {

@@ -13,8 +13,10 @@ import (
 
 	"nats-lite/internal/ack"
 	"nats-lite/internal/config"
+	"nats-lite/internal/dedup"
 	"nats-lite/internal/durable"
 	"nats-lite/internal/flowcontrol"
+	"nats-lite/internal/headers"
 	"nats-lite/internal/protocol"
 	"nats-lite/internal/store"
 	"nats-lite/internal/topics"
@@ -27,6 +29,7 @@ type Server struct {
 	ack         *ack.Tracker
 	durable     *durable.Store
 	pullCursors *PullCursorStore
+	dedup       *dedup.Deduplicator
 	config      *config.Config
 	mu          sync.Mutex
 	clients     map[*Client]bool
@@ -106,6 +109,13 @@ func New(cfg *config.Config) (*Server, error) {
 	ackTimeout, _ := cfg.GetACKTimeout()
 	tracker := ack.NewTracker(ackTimeout, cfg.ACK.MaxRetries)
 
+	var deduplicator *dedup.Deduplicator
+	if cfg.Deduplication.Enabled {
+		windowSize, _ := cfg.GetDeduplicationWindowSize()
+		deduplicator = dedup.New(windowSize, cfg.Deduplication.MaxEntries)
+		log.Printf("Deduplication enabled: window=%v, max_entries=%d", windowSize, cfg.Deduplication.MaxEntries)
+	}
+
 	srv := &Server{
 		addr:        cfg.Server.Port,
 		matcher:     topics.NewMatcher(),
@@ -113,6 +123,7 @@ func New(cfg *config.Config) (*Server, error) {
 		ack:         tracker,
 		durable:     ds,
 		pullCursors: newPullCursorStore(),
+		dedup:       deduplicator,
 		clients:     make(map[*Client]bool),
 		config:      cfg,
 	}
@@ -223,7 +234,23 @@ func (s *Server) handleConnection(conn net.Conn) {
 }
 
 func (s *Server) handlePub(cmd *protocol.Command) {
-	seq, err := s.store.Append(cmd.Subject, cmd.Payload)
+	if cmd.Headers == nil {
+		cmd.Headers = headers.New()
+	}
+
+	if cmd.Headers.Get(headers.MessageID) == "" {
+		cmd.Headers.Set(headers.MessageID, s.dedup.GenerateID(cmd.Subject, cmd.Payload))
+	}
+
+	if s.dedup != nil {
+		msgID := cmd.Headers.Get(headers.MessageID)
+		if s.dedup.IsDuplicate(msgID) {
+			log.Printf("Duplicate message detected: %s", msgID)
+			return
+		}
+	}
+
+	seq, err := s.store.AppendWithHeaders(cmd.Subject, cmd.Headers, cmd.Payload)
 	if err != nil {
 		log.Println("Storage error:", err)
 	}

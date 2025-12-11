@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"nats-lite/internal/headers"
 	"os"
 	"path/filepath"
 	"sort"
@@ -137,6 +138,37 @@ func (s *Store) Append(subject string, data []byte) (uint64, error) {
 		Sequence:  s.nextSeq,
 		Timestamp: time.Now().UnixNano(),
 		Subject:   subject,
+		Data:      data,
+	}
+
+	offset, _, err := s.activeSeg.Append(rec)
+	if err != nil {
+		return 0, err
+	}
+
+	seq := s.nextSeq
+	s.index[seq] = Location{SegmentBase: s.activeSeg.BaseSequence, Offset: offset}
+	s.nextSeq++
+
+	return seq, nil
+}
+
+func (s *Store) AppendWithHeaders(subject string, hdrs headers.Headers, data []byte) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Rotation check
+	if s.activeSeg.currentSize >= s.maxSegmentSize {
+		if err := s.rotate(); err != nil {
+			return 0, err
+		}
+	}
+
+	rec := &Record{
+		Sequence:  s.nextSeq,
+		Timestamp: time.Now().UnixNano(),
+		Subject:   subject,
+		Headers:   hdrs,
 		Data:      data,
 	}
 

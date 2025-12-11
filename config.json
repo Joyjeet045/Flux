@@ -30,5 +30,10 @@
     "default_buffer_size": 1000,
     "default_slow_threshold": 0.8,
     "backpressure_mode": "drop"
+  },
+  "deduplication": {
+    "enabled": true,
+    "window_size": "5m",
+    "max_entries": 100000
   }
 }

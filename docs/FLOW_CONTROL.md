@@ -2,53 +2,72 @@
 
 ## Overview
 
-The NATS-Lite flow control system provides sophisticated backpressure handling and rate limiting for both push and pull consumers. This prevents slow consumers from overwhelming the system and allows fine-grained control over message delivery rates.
+The NATS-Lite flow control system provides sophisticated backpressure handling and rate limiting for both push and pull consumers. This system prevents slow consumers from overwhelming the broker and enables fine-grained control over message delivery rates.
 
-## Features
+---
 
-### 1. **Push Mode**
+## Core Features
+
+### Push Mode
+
+Push mode enables server-driven message delivery with the following capabilities:
+
 - **Active Message Delivery**: Server actively pushes messages to consumers
-- **Rate Limiting**: Token bucket algorithm limits messages per second
+- **Rate Limiting**: Token bucket algorithm controls messages per second
 - **Backpressure Handling**: Buffered queue with configurable overflow behavior
-- **Slow Consumer Detection**: Automatic detection based on buffer usage
+- **Slow Consumer Detection**: Automatic detection based on buffer utilization
 
-### 2. **Pull Mode**
-- **Consumer-Controlled**: Consumer explicitly requests messages in batches
-- **Natural Backpressure**: Consumer pulls at their own pace
-- **Rate Limiting**: Optional rate limits on pull requests
-- **Efficient Batching**: Reduces network overhead
+### Pull Mode
 
-### 3. **Backpressure Modes**
+Pull mode provides consumer-controlled message delivery:
+
+- **Consumer-Controlled Delivery**: Consumers explicitly request messages in batches
+- **Natural Backpressure**: Consumers pull messages at their own processing rate
+- **Optional Rate Limiting**: Configurable rate limits on pull requests
+- **Efficient Batching**: Reduces network overhead through batch operations
+
+### Backpressure Modes
 
 #### Drop Mode (Default)
-- Drops messages when buffer is full
-- Best for real-time data where old messages lose value
-- Tracks dropped message count
+
+- Drops messages when buffer reaches capacity
+- Optimal for real-time data where message freshness is critical
+- Tracks dropped message count for monitoring
 
 #### Block Mode
-- Blocks publisher until buffer space available
-- Guarantees delivery but may slow publishers
-- Use for critical data
+
+- Blocks publisher until buffer space becomes available
+- Guarantees message delivery at the cost of publisher throughput
+- Recommended for critical data that cannot be lost
 
 #### Shed Mode
+
 - Drops messages only for slow consumers
-- Protects fast consumers from slow ones
-- Hybrid approach
+- Protects fast consumers from being impacted by slow ones
+- Provides balanced approach between drop and block modes
+
+---
 
 ## Protocol Commands
 
-### FLOWCTL - Configure Flow Control
+### FLOWCTL Command
 
+Configure flow control parameters for a subscription.
+
+**Syntax:**
 ```
 FLOWCTL <sid> <mode> [rate] [burst] [buffer]
 ```
 
 **Parameters:**
-- `sid`: Subscription ID
-- `mode`: PUSH or PULL
-- `rate`: Messages per second (0 = unlimited)
-- `burst`: Burst capacity for rate limiter
-- `buffer`: Buffer size (messages)
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `sid` | string | Subscription identifier |
+| `mode` | enum | PUSH or PULL |
+| `rate` | float | Messages per second (0 = unlimited) |
+| `burst` | integer | Burst capacity for rate limiter |
+| `buffer` | integer | Buffer size in messages |
 
 **Examples:**
 ```
@@ -62,14 +81,17 @@ FLOWCTL sub3 PUSH 1000 100 5000
 +OK mode=PUSH rate=100 burst=20 buffer=1000
 ```
 
-### STATS - Get Flow Control Statistics
+### STATS Command
 
+Retrieve flow control statistics for subscriptions.
+
+**Syntax:**
 ```
 STATS [sid]
 ```
 
 **Parameters:**
-- `sid`: (Optional) Specific subscription ID, omit for all subscriptions
+- `sid`: Optional subscription ID. Omit to retrieve statistics for all subscriptions.
 
 **Response:**
 ```json
@@ -88,9 +110,13 @@ STATS [sid]
 }
 ```
 
+---
+
 ## Configuration
 
-### config.json
+### Server Configuration
+
+Add the following to `config.json`:
 
 ```json
 {
@@ -106,244 +132,265 @@ STATS [sid]
 }
 ```
 
-**Parameters:**
-- `enable_rate_limit`: Enable rate limiting globally
-- `enable_backpressure`: Enable backpressure handling
-- `default_rate_limit`: Default messages per second
-- `default_rate_burst`: Default burst capacity
-- `default_buffer_size`: Default buffer size per consumer
-- `default_slow_threshold`: Buffer usage threshold for slow consumer (0.0-1.0)
-- `backpressure_mode`: "drop", "block", or "shed"
+**Configuration Parameters:**
 
-## Usage Examples
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `enable_rate_limit` | boolean | `true` | Enable global rate limiting |
+| `enable_backpressure` | boolean | `true` | Enable backpressure handling |
+| `default_rate_limit` | float | `1000.0` | Default messages per second |
+| `default_rate_burst` | integer | `100` | Default burst capacity |
+| `default_buffer_size` | integer | `1000` | Default buffer size per consumer |
+| `default_slow_threshold` | float | `0.8` | Buffer usage threshold (0.0-1.0) |
+| `backpressure_mode` | string | `"drop"` | Mode: "drop", "block", or "shed" |
 
-### Example 1: High-Throughput Consumer
+---
+
+## Implementation Examples
+
+### High-Throughput Consumer
 
 ```go
-// Subscribe to subject
 client.Send("SUB orders.created sub1\r\n")
 
-// Configure for high throughput
 client.Send("FLOWCTL sub1 PUSH 5000 500 10000\r\n")
-// 5000 msg/sec, burst of 500, buffer 10000 messages
 ```
 
-### Example 2: Slow Consumer Protection
+Configuration: 5000 msg/sec, burst of 500, buffer of 10000 messages
+
+### Slow Consumer Protection
 
 ```go
-// Subscribe with small buffer
 client.Send("SUB logs.debug sub2\r\n")
 
-// Low rate limit with drop mode
 client.Send("FLOWCTL sub2 PUSH 10 5 100\r\n")
-// 10 msg/sec, burst 5, buffer 100 (drops excess)
 ```
 
-### Example 3: Pull-Based Consumer
+Configuration: 10 msg/sec, burst of 5, buffer of 100 (drops excess)
+
+### Pull-Based Consumer
 
 ```go
-// Subscribe
 client.Send("SUB events.analytics sub3\r\n")
 
-// Configure pull mode
 client.Send("FLOWCTL sub3 PULL 0 0 1000\r\n")
 
-// Consumer pulls when ready
 for {
     client.Send("PULL events.analytics 50\r\n")
-    // Process 50 messages
     time.Sleep(1 * time.Second)
 }
 ```
 
-### Example 4: Dynamic Reconfiguration
+### Dynamic Reconfiguration
 
 ```go
-// Start with conservative settings
 client.Send("FLOWCTL sub1 PUSH 100 10 500\r\n")
 
-// Monitor performance
 client.Send("STATS sub1\r\n")
 
-// Increase throughput based on stats
 client.Send("FLOWCTL sub1 PUSH 1000 100 2000\r\n")
 ```
+
+---
 
 ## Monitoring
 
 ### Key Metrics
 
-1. **buffered**: Current messages in buffer
-2. **dropped**: Total dropped messages (drop/shed mode)
-3. **delivered**: Total delivered messages
-4. **buffer_usage**: 0.0-1.0, percentage of buffer used
-5. **slow_consumer**: Boolean flag if usage > threshold
-6. **rate_limit_tokens**: Available tokens for rate limiter
+| Metric | Description |
+|--------|-------------|
+| `buffered` | Current messages in buffer |
+| `dropped` | Total dropped messages (drop/shed mode) |
+| `delivered` | Total delivered messages |
+| `buffer_usage` | Buffer utilization (0.0-1.0) |
+| `slow_consumer` | Boolean flag if usage exceeds threshold |
+| `rate_limit_tokens` | Available tokens for rate limiter |
 
 ### Slow Consumer Detection
 
-A consumer is marked as "slow" when:
+A consumer is marked as slow when:
 ```
 buffer_usage > slow_threshold (default: 0.8)
 ```
 
-This triggers different behavior based on backpressure mode:
-- **Drop**: Continues dropping
-- **Block**: Continues blocking
-- **Shed**: Starts dropping for this consumer only
+Behavior based on backpressure mode:
+- **Drop Mode**: Continues dropping messages
+- **Block Mode**: Continues blocking publisher
+- **Shed Mode**: Begins dropping for this consumer only
+
+---
 
 ## Performance Tuning
 
 ### Rate Limiting
 
-**Token Bucket Algorithm:**
+The token bucket algorithm operates as follows:
 - `rate`: Tokens added per second
-- `burst`: Maximum tokens (bucket capacity)
-- Each message consumes 1 token
+- `burst`: Maximum token capacity
+- Each message consumes one token
 
-**Tuning:**
-- High throughput: `rate=5000, burst=500`
-- Moderate: `rate=1000, burst=100`
-- Low/controlled: `rate=100, burst=10`
+**Tuning Guidelines:**
+
+| Throughput | Rate | Burst |
+|------------|------|-------|
+| High | 5000 | 500 |
+| Moderate | 1000 | 100 |
+| Low/Controlled | 100 | 10 |
 
 ### Buffer Sizing
 
-**Guidelines:**
-- **Real-time data**: Small buffer (100-500)
-- **Batch processing**: Large buffer (5000-10000)
-- **Critical data**: Medium buffer with block mode (1000-2000)
+**Sizing Guidelines:**
 
-**Formula:**
+| Use Case | Buffer Size |
+|----------|-------------|
+| Real-time data | 100-500 |
+| Batch processing | 5000-10000 |
+| Critical data (block mode) | 1000-2000 |
+
+**Sizing Formula:**
 ```
-buffer_size = rate * latency_tolerance_seconds
+buffer_size = rate × latency_tolerance_seconds
 ```
 
-Example: 1000 msg/sec with 2s tolerance = 2000 buffer
+Example: 1000 msg/sec with 2s tolerance = 2000 buffer size
 
 ### Backpressure Mode Selection
 
 | Use Case | Mode | Rationale |
 |----------|------|-----------|
-| Real-time metrics | Drop | Old data loses value |
-| Financial transactions | Block | No data loss acceptable |
-| Mixed consumers | Shed | Protect fast from slow |
-| Logs/debugging | Drop | Volume over completeness |
+| Real-time metrics | Drop | Message freshness over completeness |
+| Financial transactions | Block | Zero data loss requirement |
+| Mixed consumers | Shed | Protect fast from slow consumers |
+| Logs/debugging | Drop | Volume prioritized over completeness |
+
+---
 
 ## Architecture
 
 ### Components
 
-1. **TokenBucket** (`limiter.go`)
-   - Rate limiting implementation
-   - Thread-safe token management
-   - Automatic refill
+**TokenBucket** (`limiter.go`)
+- Rate limiting implementation
+- Thread-safe token management
+- Automatic token refill
 
-2. **BackpressureHandler** (`backpressure.go`)
-   - Buffered message queue
-   - Overflow detection
-   - Slow consumer tracking
+**BackpressureHandler** (`backpressure.go`)
+- Buffered message queue
+- Overflow detection
+- Slow consumer tracking
 
-3. **FlowControlledConsumer** (`consumer.go`)
-   - Combines rate limiting + backpressure
-   - Push/Pull mode support
-   - Statistics collection
+**FlowControlledConsumer** (`consumer.go`)
+- Combines rate limiting and backpressure
+- Push/Pull mode support
+- Statistics collection
 
 ### Message Flow
 
-#### Push Mode:
+#### Push Mode
 ```
 Publisher → Store → Matcher → FlowController → Buffer → RateLimiter → Consumer
                                       ↓
                                   (if full)
-                                   Drop/Block
+                                 Drop/Block
 ```
 
-#### Pull Mode:
+#### Pull Mode
 ```
 Consumer Request → FlowController → RateLimiter → Buffer → Dequeue → Consumer
-                                                      ↑
+                                                     ↑
                           Publisher → Store → Matcher → Enqueue
 ```
 
+---
+
 ## Testing
 
-Run the comprehensive test suite:
+Execute the comprehensive test suite:
 
 ```bash
-# Build and run server
+# Build and start server
 go build -o server.exe ./cmd/server
 ./server.exe
 
-# In another terminal, run flow control tests
+# Run flow control tests
 go build -o flowcontrol-test.exe ./cmd/flowcontrol-test
 ./flowcontrol-test.exe
 ```
 
-### Test Scenarios
+**Test Scenarios:**
+1. Rate limit verification using token bucket
+2. Backpressure confirmation with drop behavior
+3. Pull mode validation for consumer-controlled delivery
+4. Slow consumer detection verification
+5. Dynamic reconfiguration testing
 
-1. **Rate Limit Test**: Verifies token bucket limits msg/sec
-2. **Backpressure Test**: Confirms drop behavior on overflow
-3. **Pull Mode Test**: Validates consumer-controlled delivery
-4. **Slow Consumer Test**: Checks slow consumer detection
-5. **Dynamic Reconfig Test**: Tests runtime configuration changes
+---
 
 ## Best Practices
 
 1. **Start Conservative**: Begin with lower rates and increase based on monitoring
-2. **Monitor Stats**: Regularly check `STATS` to detect issues
-3. **Match Buffer to Rate**: `buffer_size ≈ rate * expected_latency`
-4. **Use Pull for Batch**: Pull mode ideal for batch processing
+2. **Monitor Statistics**: Regularly check STATS to detect issues
+3. **Match Buffer to Rate**: `buffer_size ≈ rate × expected_latency`
+4. **Use Pull for Batch**: Pull mode optimal for batch processing workloads
 5. **Separate Critical Paths**: Use different subscriptions for critical vs. non-critical data
-6. **Test Under Load**: Simulate peak load to tune settings
-7. **Set Alerts**: Alert on high `buffer_usage` or `dropped` counts
+6. **Test Under Load**: Simulate peak load conditions to tune settings
+7. **Set Alerts**: Configure alerts for high buffer_usage or dropped counts
+
+---
 
 ## Troubleshooting
 
-### Problem: Messages Being Dropped
+### Messages Being Dropped
 
-**Symptoms:** `dropped` count increasing in stats
+**Symptoms:** Increasing `dropped` count in statistics
 
-**Solutions:**
+**Resolution:**
 1. Increase `buffer_size`
 2. Increase `rate_limit`
-3. Switch to `block` mode if data loss unacceptable
+3. Switch to `block` mode if data loss is unacceptable
 4. Optimize consumer processing speed
 
-### Problem: Slow Consumer Flag Set
+### Slow Consumer Flag Set
 
-**Symptoms:** `slow_consumer: true` in stats
+**Symptoms:** `slow_consumer: true` in statistics
 
-**Solutions:**
+**Resolution:**
 1. Increase consumer processing capacity
-2. Use pull mode for better control
+2. Switch to pull mode for better control
 3. Reduce message rate
 4. Increase buffer size temporarily
 
-### Problem: Publisher Blocking
+### Publisher Blocking
 
-**Symptoms:** Publisher hangs or slows down
+**Symptoms:** Publisher hangs or experiences slowdown
 
-**Solutions:**
+**Resolution:**
 1. Switch from `block` to `drop` or `shed` mode
 2. Increase buffer sizes
 3. Increase rate limits
-4. Scale out consumers
+4. Scale out consumers horizontally
 
-### Problem: Uneven Message Delivery
+### Uneven Message Delivery
 
 **Symptoms:** Bursty delivery despite rate limiting
 
-**Solutions:**
+**Resolution:**
 1. Reduce `burst` parameter
-2. Ensure `rate` is appropriate
+2. Verify `rate` is appropriate
 3. Check network latency
 4. Monitor `rate_limit_tokens`
 
-## Future Enhancements
+---
 
-- [ ] Per-subject flow control policies
-- [ ] Adaptive rate limiting based on consumer performance
-- [ ] Priority queues for message ordering
-- [ ] Flow control metrics export (Prometheus)
-- [ ] Circuit breaker integration
-- [ ] Automatic slow consumer disconnection
+## Summary
+
+The flow control system provides production-grade message delivery control:
+
+- **Push and Pull Modes**: Flexible delivery patterns
+- **Rate Limiting**: Token bucket algorithm for precise control
+- **Backpressure Handling**: Multiple strategies (drop, block, shed)
+- **Slow Consumer Detection**: Automatic identification and handling
+- **Dynamic Configuration**: Runtime reconfiguration without restart
+- **Comprehensive Monitoring**: Real-time statistics and metrics
+
+These features enable reliable, high-performance message delivery in NATS-Lite.
