@@ -1,0 +1,164 @@
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"log"
+	"math/rand"
+	"net"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"time"
+
+	"nats-lite/internal/scheduler"
+)
+
+type Worker struct {
+	ID       string
+	conn     net.Conn
+	cpuUsage float64
+}
+
+func NewWorker(id string, brokerAddr string) (*Worker, error) {
+	conn, err := net.Dial("tcp", brokerAddr)
+	if err != nil {
+		return nil, err
+	}
+	return &Worker{
+		ID:   id,
+		conn: conn,
+	}, nil
+}
+
+func (w *Worker) StartHeartbeat() {
+	ticker := time.NewTicker(5 * time.Second)
+	for range ticker.C {
+		// Simulating CPU usage fluctuations
+		w.cpuUsage = 10.0 + rand.Float64()*20.0
+
+		hb := scheduler.WorkerHeartbeat{
+			WorkerID: w.ID,
+			CPUUsage: w.cpuUsage,
+			RAMUsage: 512.0, // MB
+			LastSeen: time.Now().Unix(),
+		}
+
+		data, _ := json.Marshal(hb)
+		msg := fmt.Sprintf("PUB worker.heartbeat %d\r\n%s\r\n", len(data), string(data))
+		w.conn.Write([]byte(msg))
+	}
+}
+
+func (w *Worker) Listen() {
+	// Subscribe to my personal channel
+	// SUB worker.<ID>.jobs <sid>
+	subCmd := fmt.Sprintf("SUB worker.%s.jobs 1\r\n", w.ID)
+	w.conn.Write([]byte(subCmd))
+	log.Printf("Worker %s listening for jobs...", w.ID)
+
+	reader := bufio.NewReader(w.conn)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			log.Fatal("Connection lost:", err)
+		}
+		line = strings.TrimSpace(line)
+
+		if strings.HasPrefix(line, "PING") {
+			w.conn.Write([]byte("PONG\r\n"))
+			continue
+		}
+
+		if strings.HasPrefix(line, "MSG") {
+			// MSG <subject> <sid> <size>
+			parts := strings.Split(line, " ")
+			size, _ := strconv.Atoi(parts[3])
+
+			// Read payload
+			payloadBuf := make([]byte, size)
+			_, err := reader.Read(payloadBuf) // In real impl, readFull
+			if err != nil {
+				continue
+			}
+			// Read the trailing \r\n
+			reader.ReadString('\n')
+
+			go w.ProcessJob(payloadBuf)
+		}
+	}
+}
+
+func (w *Worker) ProcessJob(data []byte) {
+	var job scheduler.Job
+	if err := json.Unmarshal(data, &job); err != nil {
+		log.Println("Invalid job format:", err)
+		return
+	}
+
+	log.Printf("Received Job %s: %s", job.ID, job.Payload)
+
+	result := scheduler.JobResult{
+		JobID:    job.ID,
+		WorkerID: w.ID,
+		Status:   scheduler.StatusRunning,
+	}
+
+	start := time.Now()
+	var output string
+	var runErr error
+
+	if job.Type == scheduler.JobTypeShell {
+		// Windows specific shell execution
+		cmd := exec.Command("cmd", "/C", job.Payload)
+		out, err := cmd.CombinedOutput()
+		output = string(out)
+		runErr = err
+	} else if job.Type == scheduler.JobTypeDocker {
+		// Placeholder for Docker execution
+		output = "Docker execution not yet implemented"
+	}
+
+	duration := time.Since(start).Milliseconds()
+	result.DurationMs = duration
+	result.Output = output
+
+	if runErr != nil {
+		result.Status = scheduler.StatusFailed
+		result.Output += fmt.Sprintf("\nError: %s", runErr.Error())
+	} else {
+		result.Status = scheduler.StatusCompleted
+	}
+
+	w.SendResult(result)
+}
+
+func (w *Worker) SendResult(res scheduler.JobResult) {
+	data, _ := json.Marshal(res)
+	msg := fmt.Sprintf("PUB jobs.status %d\r\n%s\r\n", len(data), string(data))
+	w.conn.Write([]byte(msg))
+	log.Printf("Job %s completed (%s)", res.JobID, res.Status)
+}
+
+func main() {
+	workerID := fmt.Sprintf("worker-%d", rand.Intn(1000))
+	if len(os.Args) > 1 {
+		workerID = os.Args[1]
+	}
+
+	log.Printf("Starting Worker: %s", workerID)
+
+	// Retry loop for connection
+	for {
+		worker, err := NewWorker(workerID, "localhost:4223")
+		if err == nil {
+			go worker.StartHeartbeat()
+			worker.Listen()
+			break
+		}
+		log.Println("Waiting for Broker...")
+		time.Sleep(3 * time.Second)
+	}
+}

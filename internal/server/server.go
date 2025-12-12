@@ -327,6 +327,7 @@ func (s *Server) handlePub(client *Client, cmd *protocol.Command) {
 	client.conn.Write([]byte("+OK\r\n"))
 
 	subs := s.matcher.Match(cmd.Subject)
+	log.Printf("DEBUG:  PUB to subject=%s matched %d subscribers", cmd.Subject, len(subs))
 	for _, sub := range subs {
 		s.ack.Track(seq, sub.Client, sub.Sid, cmd.Subject, cmd.Payload)
 		sub.Client.Send(sub.Sid, cmd.Subject, cmd.Payload, seq)
@@ -352,17 +353,22 @@ func (s *Server) handleSub(c *Client, cmd *protocol.Command) {
 		Client:  c,
 	}
 	s.matcher.Subscribe(sub)
+	log.Printf("DEBUG: Subscribed client to subject=%s sid=%s queue=%s", cmd.Subject, cmd.Sid, queue)
 
-	c.mu.Lock()
-	if _, exists := c.flowControllers[cmd.Sid]; !exists {
-		fcConfig := s.getDefaultFlowControlConfig()
-		c.flowControllers[cmd.Sid] = flowcontrol.NewFlowControlledConsumer(
-			cmd.Sid,
-			fcConfig,
-			c,
-		)
-	}
-	c.mu.Unlock()
+	// DISABLED: Auto flow control creation causes message delivery issues
+	// Clients should use FLOWCTL command explicitly if they want flow control
+	/*
+		c.mu.Lock()
+		if _, exists := c.flowControllers[cmd.Sid]; !exists {
+			fcConfig := s.getDefaultFlowControlConfig()
+			c.flowControllers[cmd.Sid] = flowcontrol.NewFlowControlledConsumer(
+				cmd.Sid,
+				fcConfig,
+				c,
+			)
+		}
+		c.mu.Unlock()
+	*/
 
 	if durableName != "" {
 		cursorKey := cmd.Subject + ":" + durableName
