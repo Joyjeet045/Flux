@@ -4,119 +4,191 @@
 
 # Flux
 
-Flux is a high-performance, lightweight, and distributed message broker written in Go. It is designed to provide robust Pub/Sub capabilities, strong persistence, and horizontal scalability through Raft-based clustering. Flux bridges the gap between lightweight queues and heavy enterprise brokers by offering durability and clustering in a compiled, single-binary footprint.
+**Distributed job scheduler using a custom Raft-based broker with WAL persistence, time-based scheduling, and intelligent worker coordination.**
+
+Flux is a production-grade distributed message broker written in Go, featuring a complete job scheduler implementation built on top. The system demonstrates real-world distributed systems patterns including Raft consensus clustering, write-ahead logging, and smart task distribution across dynamic worker pools.
+
+## System Components
+
+### Message Broker (Core Infrastructure)
+A high-performance Pub/Sub broker providing the communication backbone:
+- **Raft Consensus Clustering**: Leader election and log replication for fault tolerance
+- **Write-Ahead Log (WAL)**: Persistent, append-only storage with O(1) writes
+- **Message Deduplication**: Exactly-once processing using strict Message-IDs
+- **Flow Control**: Rate limiting and backpressure protection
+- **Atomic Headers**: Key-value metadata support separate from payload
+- **Dead Letter Queues (DLQ)**: Automatic routing of failed deliveries
+
+### Job Scheduler (Application Layer)
+A distributed task execution system using the broker:
+- **Time-Based Scheduling**: Execute jobs at specific future timestamps
+- **Smart Load Balancing**: CPU-aware worker selection via heartbeats
+- **Worker Discovery**: Dynamic worker registration and health monitoring
+- **Shell & Docker Execution**: Support for both shell commands and containerized tasks
+- **Reliable Delivery**: ACK-based guarantees prevent job loss
+- **Status Tracking**: Real-time job execution monitoring
+
+## Quick Start
+
+### Running the Job Scheduler
+
+1. **Start the Broker**
+```bash
+./server.exe
+```
+
+2. **Start the Scheduler**
+```bash
+./scheduler.exe
+```
+
+3. **Start the Coordinator**
+```bash
+./coordinator.exe
+```
+
+4. **Start a Worker**
+```bash
+./worker.exe worker-1
+```
+
+5. **Submit a Job** (via PowerShell)
+```powershell
+$body = @{
+    type = "shell"
+    payload = "echo Hello World"
+    run_in_seconds = 5
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "http://localhost:8080/submit" -Method Post -Body $body -ContentType "application/json"
+```
+
+### Automated Test
+```powershell
+.\test_flow.ps1
+```
+
+## Architecture
+
+### Message Flow
+```
+User → Scheduler → Broker (jobs.queue)
+                      ↓
+                  Coordinator (smart assignment)
+                      ↓
+                  Broker (worker.{id}.jobs)
+                      ↓
+                  Worker (execute task)
+                      ↓
+                  Broker (jobs.status)
+```
+
+### Broker Channels
+| Channel | Purpose |
+| :--- | :--- |
+| `jobs.queue` | Pending jobs ready for assignment |
+| `worker.heartbeat` | Worker health and CPU status broadcasts |
+| `worker.{id}.jobs` | Direct job delivery to specific worker |
+| `jobs.status` | Job execution results and status updates |
 
 ## Core Features
 
-### 1. Messaging Fundamentals
-*   **High Performance Protocol**: Uses a text-based TCP protocol optimized for low latency and high throughput. Supports pipelining to minimize round-trip times.
-*   **Subject-Based Addressing**: Messages are routed via hierarchical subjects (e.g., `orders.us.created`).
-    *   Wildcards: `*` matches a single token (e.g., `orders.*.created`), `>` matches all subsequent tokens (e.g., `orders.>`).
-*   **Queue Groups**: Load balance message consumption across multiple subscribers by assigning them to a Queue Group. Ideally suited for microservices worker pools.
+### Messaging Fundamentals
+- **High Performance Protocol**: Text-based TCP with pipelining support
+- **Subject-Based Addressing**: Hierarchical routing (e.g., `orders.us.created`)
+  - Wildcards: `*` (single token), `>` (all subsequent tokens)
+- **Queue Groups**: Load balanced consumption across subscriber pools
 
-### 2. Persistence & Durability
-*   **Write-Ahead Log (WAL)**: An append-only disk storage engine ensures O(1) write performance.
-*   **In-Memory Index**: Maps message sequences to disk offsets for blazing fast lookups.
-*   **Durable Subscriptions**: Clients can establish durable sessions. Flux tracks their last seen sequence, ensuring zero message loss even if the consumer disconnects for hours.
-*   **Retention Policies**:
-    *   **Time-Based**: Automatically expire messages older than N duration (e.g., 24h).
-    *   **Capacity-Based**: Rotate logs when storage exceeds a size limit (e.g., 5GB).
+### Persistence & Durability
+- **Write-Ahead Log (WAL)**: Segmented log files with automatic rotation
+- **Durable Subscriptions**: Consumer cursor tracking for crash recovery
+- **Retention Policies**:
+  - Time-based expiration (e.g., 24h)
+  - Capacity-based rotation (e.g., 5GB limit)
 
-### 3. Clustering & High Availability (HA)
-*   **Raft Consensus**: Uses the industry-standard Raft algorithm for leader election and log replication.
-*   **Zero Data Loss**: Writes are confirmed only after being replicated to a quorum of nodes.
-*   **Automatic Failover**: If the Leader node fails, a Follower is automatically promoted to Leader within seconds.
-*   **Dynamic Membership**: Nodes can join or leave the cluster at runtime without service interruption via the `JOIN` command.
+### Clustering & High Availability
+- **Raft Consensus**: Industry-standard leader election and replication
+- **Zero Data Loss**: Quorum-based write confirmation
+- **Automatic Failover**: Sub-second leader promotion
+- **Dynamic Membership**: Runtime JOIN/LEAVE operations
 
-### 4. Advanced Capabilities
-*   **Message Deduplication**: Enforces exactly-once processing windows using strict Message-IDs.
-*   **Flow Control**: Protects the broker and clients using rate limiting (Token Bucket) and backpressure.
-*   **Atomic Headers**: Messages support key-value metadata headers (e.g., `Trace-ID: 123`) separate from the payload.
-*   **Dead Letter Queues (DLQ)**: Failed deliveries are automatically routed to DLQ subjects for forensic analysis.
-*   **Review & Replay**: Clients can request to replay historical data from any point in time or sequence.
-
-## Architecture Highlights
-
-Flux separates concerns into modular subsystems:
-*   **WAL Store**: Manages segmented log files on disk. Old segments are rotated and pruned based on retention policy.
-*   **Durable Engine**: Persists subscription cursors (Ack offsets) asynchronously, allowing fast recovery on restart.
-*   **Raft FSM**: The Finite State Machine (FSM) applies replicated log entries to the local Store, ensuring all nodes in the cluster eventually hold the exact same data.
-*   **Protocol Layer**: A zero-allocation text parser handles high-throughput command processing.
-
-## Configuration
-
-Flux is configured via a JSON file. Example `config.json`:
-
-```json
-{
-  "server": {
-    "host": "0.0.0.0",
-    "port": 4222
-  },
-  "storage": {
-    "dir": "./data",
-    "retention": {
-      "max_age": "24h",
-      "max_bytes": 1073741824
-    }
-  },
-  "cluster": {
-    "enabled": true,
-    "node_id": "node-1",
-    "raft_addr": "127.0.0.1:7001",
-    "raft_dir": "./data/raft"
-  }
-}
-```
+### Advanced Capabilities
+- **Flow Control**: Token bucket rate limiting + backpressure
+- **Review & Replay**: Historical data access by sequence or timestamp
+- **Message Deduplication**: Exactly-once delivery windows
 
 ## Protocol Overview
-
-Flux uses a line-based text protocol similar to other lightweight brokers.
 
 ### Client Commands
 
 | Command | Syntax | Description |
 | :--- | :--- | :--- |
-| **PUB** | `PUB <subject> <len>` | Publish a message payload. follows with `\r\n<payload>` |
-| **HPUB** | `HPUB <subj> <hdr_len> <tot_len>` | Publish with headers. Follows with `\r\n<headers><payload>` |
-| **SUB** | `SUB <subject> <sid> [group]` | Subscribe to a topic with a Subscriber ID. |
-| **ACK** | `ACK <seq> [durable_key]` | Acknowledge receipt of a message (for At-Least-Once). |
-| **PULL** | `PULL <subject> <count>` | Request `count` messages (Pull Consumer). |
-| **FLOWCTL** | `FLOWCTL <sid> <mode> [args...]` | Configure flow control. E.g., `PUSH 100 10` or `PULL`. |
-| **STATS** | `STATS [sid]` | Request statistics for a subscriber or the connection. |
-| **PING** | `PING` | Keep-alive check. |
-| **INFO** | `INFO` | Request broker topology and details. |
-| **REPLAY** | `REPLAY <seq\|time> <val>` | Request replay from sequence or timestamp. |
+| **PUB** | `PUB <subject> <len>` | Publish message payload |
+| **HPUB** | `HPUB <subj> <hdr_len> <tot_len>` | Publish with headers |
+| **SUB** | `SUB <subject> <sid> [group]` | Subscribe to topic |
+| **ACK** | `ACK <seq> [durable_key]` | Acknowledge message receipt |
+| **PULL** | `PULL <subject> <count>` | Request messages (pull mode) |
+| **FLOWCTL** | `FLOWCTL <sid> <mode> [args]` | Configure flow control |
+| **STATS** | `STATS [sid]` | Request statistics |
+| **PING** | `PING` | Keep-alive check |
+| **REPLAY** | `REPLAY <seq|time> <val>` | Replay from sequence/timestamp |
 
 ### Server Responses
 
 | Command | Syntax | Description |
 | :--- | :--- | :--- |
-| **MSG** | `MSG <subj> <sid> <len>` | Message pushed to client. |
-| **+OK** | `+OK [msg]` | Operation success. |
-| **-ERR** | `-ERR <error_message>` | Operation error (e.g., `-ERR NOT_LEADER`). |
-| **PONG** | `PONG` | Response to PING. |
-| **INFO** | `INFO <json>` | Broker information and topology. |
+| **MSG** | `MSG <subj> <sid> <len> <seq>` | Message delivery |
+| **+OK** | `+OK [msg]` | Operation success |
+| **-ERR** | `-ERR <error>` | Operation error |
+| **PONG** | `PONG` | PING response |
 
 ### Cluster Commands (Admin)
 
 | Command | Syntax | Description |
 | :--- | :--- | :--- |
-| **JOIN** | `JOIN <node_id> <addr>` | Add a new node to the cluster. |
-| **LEAVE** | `LEAVE <node_id>` | Remove a node from the cluster. |
+| **JOIN** | `JOIN <node_id> <addr>` | Add node to cluster |
+| **LEAVE** | `LEAVE <node_id>` | Remove node from cluster |
 
-## Build & Run
+## Configuration
 
-### Build
-```bash
-go build -o flux ./cmd/server
+Example `config.json`:
+
+```json
+{
+  "server": {
+    "port": ":4223",
+    "data_dir": "data"
+  },
+  "ack": {
+    "timeout": "60s",
+    "max_retries": 3
+  },
+  "retention": {
+    "max_age": "24h",
+    "max_bytes": 1073741824
+  },
+  "flow_control": {
+    "enable_rate_limit": true,
+    "default_buffer_size": 10000,
+    "backpressure_mode": "block"
+  }
+}
 ```
 
-### Run
-```bash
-# Standalone
-./flux -config config.json
+## Build
 
-# Cluster Node
-./flux -config node1.json
+```bash
+# Build all components
+go build -o server.exe ./cmd/server
+go build -o scheduler.exe ./cmd/scheduler
+go build -o coordinator.exe ./cmd/coordinator
+go build -o worker.exe ./cmd/worker
 ```
+
+## Use Cases
+
+- **Task Scheduling**: Cron-like job execution with distributed workers
+- **Message Queue**: Reliable Pub/Sub for microservices
+- **Event Streaming**: Real-time data pipeline backbone
+- **Job Processing**: Background task execution (video encoding, data processing)
+- **Distributed Systems Learning**: Reference implementation of Raft, WAL, and consensus patterns
