@@ -73,18 +73,30 @@ func (w *Worker) Listen() {
 		}
 
 		if strings.HasPrefix(line, "MSG") {
-			// MSG <subject> <sid> <size>
+			// MSG <subject> <sid> <size> <seq>
 			parts := strings.Split(line, " ")
 			size, _ := strconv.Atoi(parts[3])
 
+			// Extract sequence number if present (parts[4])
+			var seq string
+			if len(parts) > 4 {
+				seq = parts[4]
+			}
+
 			// Read payload
 			payloadBuf := make([]byte, size)
-			_, err := reader.Read(payloadBuf) // In real impl, readFull
+			_, err := reader.Read(payloadBuf)
 			if err != nil {
 				continue
 			}
 			// Read the trailing \r\n
 			reader.ReadString('\n')
+
+			// Send ACK immediately to prevent redelivery
+			if seq != "" {
+				ackCmd := fmt.Sprintf("ACK %s\r\n", seq)
+				w.conn.Write([]byte(ackCmd))
+			}
 
 			go w.ProcessJob(payloadBuf)
 		}
