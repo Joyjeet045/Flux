@@ -1,0 +1,39 @@
+{
+    "server": {
+        "port": ":4223",
+        "data_dir": "data_recovery_test"
+    },
+    "storage": {
+        "max_segment_size": 10485760
+    },
+    "retention": {
+        "max_age": "1h",
+        "max_bytes": 1073741824,
+        "check_interval": "1s"
+    },
+    "ack": {
+        "timeout": "5s",
+        "max_retries": 1
+    },
+    "durable": {
+        "flush_interval": "1s",
+        "replay_batch": 100
+    },
+    "dlq": {
+        "prefix": "DLQ."
+    },
+    "flow_control": {
+        "enable_rate_limit": false,
+        "enable_backpressure": false,
+        "default_rate_limit": 10000.0,
+        "default_rate_burst": 1000,
+        "default_buffer_size": 10000,
+        "default_slow_threshold": 0.8,
+        "backpressure_mode": "drop"
+    },
+    "deduplication": {
+        "enabled": true,
+        "window_size": "5m",
+        "max_entries": 100000
+    }
+}

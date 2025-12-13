@@ -80,7 +80,8 @@ func (t *Tracker) checkTimeouts() {
 			if msg.Retries >= t.maxRetry {
 				// Move to DLQ
 				if t.dlqHandler != nil {
-					t.dlqHandler(seq, msg.Subject, msg.Payload)
+					// Run in goroutine to prevent deadlock (handler might call Track, which needs lock)
+					go t.dlqHandler(seq, msg.Subject, msg.Payload)
 				}
 				delete(t.pending, seq)
 				continue

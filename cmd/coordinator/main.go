@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net"
@@ -60,6 +61,13 @@ func (c *Coordinator) Listen() {
 	}
 	log.Println("Subscribed to jobs.queue with queue group 'coordinators'")
 
+	// 3. Subscribe to DLQ for fault tolerance (catch failed jobs)
+	_, err = c.conn.Write([]byte("SUB DLQ.> 3\r\n"))
+	if err != nil {
+		log.Fatalf("Failed to subscribe to DLQ: %v", err)
+	}
+	log.Println("Subscribed to DLQ.>")
+
 	log.Println("Coordinator Listening loop starting...")
 
 	reader := bufio.NewReader(c.conn)
@@ -71,6 +79,11 @@ func (c *Coordinator) Listen() {
 		}
 		line = strings.TrimSpace(line)
 
+		// DEBUG: Print EVERYTHING received
+		if line != "" && !strings.HasPrefix(line, "PING") {
+			log.Printf("[RAW] %s", line)
+		}
+
 		if strings.HasPrefix(line, "PING") {
 			c.conn.Write([]byte("PONG\r\n"))
 			continue
@@ -79,8 +92,7 @@ func (c *Coordinator) Listen() {
 		if strings.HasPrefix(line, "MSG") {
 			log.Printf("DEBUG: Received MSG: %s", line)
 			parts := strings.Split(line, " ")
-			// MSG <subject> <sid> <size> [reply] (Standard NATS is inconsistent here depending on impl, simpler for now)
-			// My Broker: MSG <subject> <sid> <size>
+			// MSG <subject> <sid> <size> [reply]
 			if len(parts) < 4 {
 				continue
 			}
@@ -95,10 +107,14 @@ func (c *Coordinator) Listen() {
 			}
 
 			payloadBuf := make([]byte, size)
-			reader.Read(payloadBuf)
+			if _, err := io.ReadFull(reader, payloadBuf); err != nil {
+				log.Printf("Error reading payload: %v", err)
+				continue
+			}
 			reader.ReadString('\n') // Eat trailing \r\n
 
-			// Send ACK immediately to prevent DLQ timeout
+			// Send ACK immediately to prevent DLQ timeout (for normal messages)
+			// For DLQ messages, we also ACK to remove them from DLQ persistence
 			if seq != "" {
 				ackCmd := fmt.Sprintf("ACK %s\r\n", seq)
 				c.conn.Write([]byte(ackCmd))
@@ -110,6 +126,24 @@ func (c *Coordinator) Listen() {
 			if subject == "worker.heartbeat" {
 				c.handleHeartbeat(payloadBuf)
 			} else if subject == "jobs.queue" {
+				c.handleJob(payloadBuf)
+			} else if strings.HasPrefix(subject, "DLQ.") {
+				log.Printf("⚠️ RECOVERING FAILED JOB from %s", subject)
+
+				// CRITICAL: Parse failed worker ID and remove it immediately
+				// Subject format: DLQ.worker.<id>.jobs
+				dlqParts := strings.Split(subject, ".")
+				if len(dlqParts) >= 3 && dlqParts[1] == "worker" {
+					failedWorkerID := dlqParts[2]
+					c.mu.Lock()
+					if _, exists := c.workers[failedWorkerID]; exists {
+						log.Printf("❌ Marking worker %s as DEAD (found in DLQ)", failedWorkerID)
+						delete(c.workers, failedWorkerID)
+					}
+					c.mu.Unlock()
+				}
+
+				// Treat as new job submission - will be re-routed to a healthy worker (Worker-Slow)
 				c.handleJob(payloadBuf)
 			}
 		}

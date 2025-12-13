@@ -92,18 +92,13 @@ func (w *Worker) Listen() {
 			// Read the trailing \r\n
 			reader.ReadString('\n')
 
-			// Send ACK immediately to prevent redelivery
-			if seq != "" {
-				ackCmd := fmt.Sprintf("ACK %s\r\n", seq)
-				w.conn.Write([]byte(ackCmd))
-			}
-
-			go w.ProcessJob(payloadBuf)
+			// MOVE ACK TO PROCESS JOB TO ALLOW CRASH BEFORE ACK
+			go w.ProcessJob(payloadBuf, seq)
 		}
 	}
 }
 
-func (w *Worker) ProcessJob(data []byte) {
+func (w *Worker) ProcessJob(data []byte, seq string) {
 	var job scheduler.Job
 	if err := json.Unmarshal(data, &job); err != nil {
 		log.Println("Invalid job format:", err)
@@ -111,6 +106,18 @@ func (w *Worker) ProcessJob(data []byte) {
 	}
 
 	log.Printf("Received Job %s: %s", job.ID, job.Payload)
+
+	// CRASH SIMULATION
+	if job.Payload == "CRASH_IMMEDIATELY" {
+		log.Printf("💥 Worker %s simulates CRASH now!", w.ID)
+		os.Exit(1)
+	}
+
+	// ACK now if we didn't crash
+	if seq != "" {
+		ackCmd := fmt.Sprintf("ACK %s\r\n", seq)
+		w.conn.Write([]byte(ackCmd))
+	}
 
 	start := time.Now()
 	result := scheduler.JobResult{

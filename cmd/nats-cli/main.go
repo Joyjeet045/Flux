@@ -157,5 +157,19 @@ func main() {
 				break
 			}
 		}
+	} else if *cmd == "join" {
+		// Protocol: JOIN <node_id> <addr>\r\n
+		// Reusing flags: sub=node_id, msg=raft_addr
+		if *subject == "" || *payload == "" {
+			fmt.Println("Usage: -cmd=join -sub=<node_id> -msg=<raft_addr>")
+			os.Exit(1)
+		}
+		msg := fmt.Sprintf("JOIN %s %s\r\n", *subject, *payload)
+		conn.Write([]byte(msg))
+
+		scanner := bufio.NewScanner(conn)
+		if scanner.Scan() {
+			fmt.Println(scanner.Text())
+		}
 	}
 }

@@ -161,7 +161,23 @@ func New(cfg *config.Config) (*Server, error) {
 	tracker.SetDLQHandler(func(seq uint64, subject string, payload []byte) {
 		dlqSubject := cfg.DLQ.Prefix + subject
 		log.Printf("Moving message %d to DLQ: %s", seq, dlqSubject)
-		srv.store.Append(dlqSubject, payload)
+
+		// 1. Persist to DLQ topic
+		newSeq, err := srv.store.Append(dlqSubject, payload)
+		if err != nil {
+			log.Printf("Failed to append to DLQ: %v", err)
+			return
+		}
+
+		// 2. Notify subscribers (Coordinator needs this to recover jobs!)
+		subs := srv.matcher.Match(dlqSubject)
+		if len(subs) > 0 {
+			log.Printf("DLQ notification matched %d subscribers", len(subs))
+			for _, sub := range subs {
+				srv.ack.Track(newSeq, sub.Client, sub.Sid, dlqSubject, payload)
+				sub.Client.Send(sub.Sid, dlqSubject, payload, newSeq)
+			}
+		}
 	})
 
 	return srv, nil
