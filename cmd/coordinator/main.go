@@ -44,11 +44,11 @@ func (c *Coordinator) Listen() {
 	}
 	log.Println("Subscribed to worker.heartbeat")
 
-	_, err = c.conn.Write([]byte("SUB jobs.queue 2\r\n"))
+	_, err = c.conn.Write([]byte("SUB jobs.queue coordinators 2\r\n"))
 	if err != nil {
 		log.Fatalf("Failed to subscribe to jobs.queue: %v", err)
 	}
-	log.Println("Subscribed to jobs.queue")
+	log.Println("Subscribed to jobs.queue with queue group 'coordinators'")
 
 	log.Println("Coordinator Listening loop starting...")
 
