@@ -11,22 +11,22 @@ Write-Host "  6. Coordinator redundancy (2 coordinators)" -ForegroundColor Gray
 Write-Host "`n"
 
 # Start core services
-Write-Host "[1/3] Starting Broker..." -ForegroundColor Cyan
+Write-Host "[1/6] Starting Broker..." -ForegroundColor Cyan
 $broker = Start-Process -FilePath "powershell" -ArgumentList "-NoExit", "-Command", "./server.exe" -PassThru
 Start-Sleep -Seconds 2
 
-Write-Host "[2/3] Starting Scheduler..." -ForegroundColor Cyan
+Write-Host "[2/6] Starting Scheduler..." -ForegroundColor Cyan
 $scheduler = Start-Process -FilePath "powershell" -ArgumentList "-NoExit", "-Command", "./scheduler.exe" -PassThru
 Start-Sleep -Seconds 1
 
-Write-Host "[3/3] Starting Coordinator-1 (Primary)..." -ForegroundColor Cyan
+Write-Host "[3/6] Starting Coordinator-1 (Primary)..." -ForegroundColor Cyan
 $coordinator1 = Start-Process -FilePath "powershell" -ArgumentList "-NoExit", "-Command", "./coordinator.exe" -PassThru
 Start-Sleep -Seconds 1
 
 Write-Host "`n=== PHASE 1: Initial Setup with 1 Worker ===" -ForegroundColor Magenta
 Write-Host "Starting Worker-A..." -ForegroundColor Yellow
 $workerA = Start-Process -FilePath "powershell" -ArgumentList "-NoExit", "-Command", "./worker.exe worker-A" -PassThru
-Start-Sleep -Seconds 3
+Start-Sleep -Seconds 6
 
 Write-Host "`n=== PHASE 2: Heavy Load Test (20 jobs) ===" -ForegroundColor Magenta
 Write-Host "Submitting 20 concurrent jobs..." -ForegroundColor Yellow
@@ -79,7 +79,7 @@ Start-Sleep -Milliseconds 500
 $workerD = Start-Process -FilePath "powershell" -ArgumentList "-NoExit", "-Command", "./worker.exe worker-D" -PassThru
 Write-Host "  4 workers now active!" -ForegroundColor Green
 Write-Host "  Expected: New jobs distribute across all workers" -ForegroundColor Gray
-Start-Sleep -Seconds 3
+Start-Sleep -Seconds 6
 
 Write-Host "`n=== PHASE 4: Coordinator Redundancy ===" -ForegroundColor Magenta
 Write-Host "Starting Coordinator-2 (Backup)..." -ForegroundColor Yellow

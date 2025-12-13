@@ -5,19 +5,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net"
+	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"nats-lite/internal/scheduler"
 )
 
 type Coordinator struct {
-	conn    net.Conn
-	mu      sync.RWMutex
-	workers map[string]scheduler.WorkerHeartbeat
+	conn      net.Conn
+	connMu    sync.Mutex
+	mu        sync.RWMutex
+	workers   map[string]scheduler.WorkerHeartbeat
+	retries   map[string]int
+	retriesMu sync.Mutex
+	shutdown  chan struct{}
 }
 
 func NewCoordinator(brokerAddr string) (*Coordinator, error) {
@@ -26,8 +34,10 @@ func NewCoordinator(brokerAddr string) (*Coordinator, error) {
 		return nil, err
 	}
 	return &Coordinator{
-		conn:    conn,
-		workers: make(map[string]scheduler.WorkerHeartbeat),
+		conn:     conn,
+		workers:  make(map[string]scheduler.WorkerHeartbeat),
+		retries:  make(map[string]int),
+		shutdown: make(chan struct{}),
 	}, nil
 }
 
@@ -127,16 +137,52 @@ func (c *Coordinator) handleJob(data []byte) {
 
 	workerID := c.selectBestWorker()
 	if workerID == "" {
-		log.Printf("No available workers for Job %s! Re-queueing logic needed here.", job.ID)
+		// Check retry count
+		c.retriesMu.Lock()
+		retryCount := c.retries[job.ID]
+		if retryCount >= 5 {
+			c.retriesMu.Unlock()
+			log.Printf("Job %s exceeded max retries (5), giving up", job.ID)
+			delete(c.retries, job.ID)
+			return
+		}
+		c.retries[job.ID] = retryCount + 1
+		c.retriesMu.Unlock()
+
+		// Exponential backoff: 2^retry seconds, max 30s
+		delay := time.Duration(math.Pow(2, float64(retryCount))) * time.Second
+		if delay > 30*time.Second {
+			delay = 30 * time.Second
+		}
+
+		log.Printf("No available workers for Job %s, retry %d/%d in %v...", job.ID, retryCount+1, 5, delay)
+
+		// Requeue with backoff
+		go func() {
+			time.Sleep(delay)
+			// Republish to jobs.queue with thread-safe write
+			requeueMsg := fmt.Sprintf("PUB jobs.queue %d\r\n%s\r\n", len(data), string(data))
+			c.connMu.Lock()
+			c.conn.Write([]byte(requeueMsg))
+			c.connMu.Unlock()
+			log.Printf("Requeued Job %s (attempt %d)", job.ID, retryCount+1)
+		}()
 		return
 	}
 
+	// Success - clear retry count
+	c.retriesMu.Lock()
+	delete(c.retries, job.ID)
+	c.retriesMu.Unlock()
+
 	log.Printf("Assigning Job %s -> %s", job.ID, workerID)
 
-	// Forward to worker.<ID>.jobs
+	// Forward to worker.<ID>.jobs with thread-safe write
 	topic := fmt.Sprintf("worker.%s.jobs", workerID)
 	msg := fmt.Sprintf("PUB %s %d\r\n%s\r\n", topic, len(data), string(data))
+	c.connMu.Lock()
 	c.conn.Write([]byte(msg))
+	c.connMu.Unlock()
 }
 
 func (c *Coordinator) selectBestWorker() string {
@@ -146,29 +192,94 @@ func (c *Coordinator) selectBestWorker() string {
 	var bestWorker string
 	minCPU := 1000.0
 	now := time.Now().Unix()
+	activeWorkers := 0
 
 	for id, stats := range c.workers {
-		// Ignore stale workers (> 30s)
-		if now-stats.LastSeen > 30 {
+		// Ignore stale workers (>30s)
+		age := now - stats.LastSeen
+		if age > 30 {
 			continue
 		}
 
+		activeWorkers++
 		if stats.CPUUsage < minCPU {
 			minCPU = stats.CPUUsage
 			bestWorker = id
 		}
 	}
+
+	if bestWorker != "" {
+		log.Printf("Selected %s (CPU: %.1f%%) from %d active workers", bestWorker, minCPU, activeWorkers)
+	} else if activeWorkers == 0 {
+		log.Printf("No active workers available")
+	}
+
 	return bestWorker
 }
 
-func main() {
+func (c *Coordinator) cleanupStaleWorkers() {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
 	for {
-		coord, err := NewCoordinator("localhost:4223")
+		select {
+		case <-ticker.C:
+			c.mu.Lock()
+			now := time.Now().Unix()
+			removed := 0
+			for id, stats := range c.workers {
+				if now-stats.LastSeen > 120 {
+					delete(c.workers, id)
+					removed++
+				}
+			}
+			c.mu.Unlock()
+			if removed > 0 {
+				log.Printf("Cleaned up %d stale workers", removed)
+			}
+		case <-c.shutdown:
+			return
+		}
+	}
+}
+
+func (c *Coordinator) gracefulShutdown() {
+	close(c.shutdown)
+	c.connMu.Lock()
+	c.conn.Close()
+	c.connMu.Unlock()
+	log.Println("Coordinator shutdown complete")
+}
+
+func main() {
+	var coord *Coordinator
+	var err error
+
+	// Connect to broker with retry
+	for {
+		coord, err = NewCoordinator("localhost:4223")
 		if err == nil {
-			coord.Listen()
 			break
 		}
 		log.Println("Waiting for Broker...")
 		time.Sleep(3 * time.Second)
 	}
+
+	// Setup graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Start background cleanup
+	go coord.cleanupStaleWorkers()
+
+	// Handle shutdown signal
+	go func() {
+		<-sigChan
+		log.Println("Shutdown signal received...")
+		coord.gracefulShutdown()
+		os.Exit(0)
+	}()
+
+	// Start listening (blocks)
+	coord.Listen()
 }
