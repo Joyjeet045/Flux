@@ -28,6 +28,8 @@ type Job struct {
 	Env          map[string]string `json:"env"`
 	ScheduleTime int64             `json:"schedule_time"`
 	CreatedAt    int64             `json:"created_at"`
+	CronExpr     string            `json:"cron_expr,omitempty"` // e.g., "0 9 * * *" for daily at 9am
+	IsRecurring  bool              `json:"is_recurring"`        // true if using cron
 }
 
 // WorkerHeartbeat announces availability.
@@ -46,4 +48,6 @@ type JobResult struct {
 	Status     JobStatus `json:"status"`
 	Output     string    `json:"output"`
 	DurationMs int64     `json:"duration_ms"`
+	StartTime  int64     `json:"start_time"` // Unix timestamp
+	EndTime    int64     `json:"end_time"`   // Unix timestamp
 }

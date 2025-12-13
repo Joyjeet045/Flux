@@ -5,6 +5,7 @@ go 1.25.5
 require (
 	github.com/hashicorp/raft v1.6.0
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
+	github.com/robfig/cron/v3 v3.0.1
 )
 
 require (

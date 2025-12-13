@@ -112,13 +112,14 @@ func (w *Worker) ProcessJob(data []byte) {
 
 	log.Printf("Received Job %s: %s", job.ID, job.Payload)
 
+	start := time.Now()
 	result := scheduler.JobResult{
-		JobID:    job.ID,
-		WorkerID: w.ID,
-		Status:   scheduler.StatusRunning,
+		JobID:     job.ID,
+		WorkerID:  w.ID,
+		Status:    scheduler.StatusRunning,
+		StartTime: start.Unix(),
 	}
 
-	start := time.Now()
 	var output string
 	var runErr error
 
@@ -133,8 +134,11 @@ func (w *Worker) ProcessJob(data []byte) {
 		output = "Docker execution not yet implemented"
 	}
 
-	duration := time.Since(start).Milliseconds()
+	end := time.Now()
+	duration := end.Sub(start).Milliseconds()
+
 	result.DurationMs = duration
+	result.EndTime = end.Unix()
 	result.Output = output
 
 	if runErr != nil {
