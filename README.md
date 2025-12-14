@@ -70,18 +70,54 @@ Invoke-RestMethod -Uri "http://localhost:8080/submit" -Method Post -Body $body -
 
 ## Architecture
 
+### Architecture Diagram
+```mermaid
+graph TD
+    subgraph Clients
+        User[Client / Script]
+    end
+
+    subgraph "Flux Scheduler (API & State)"
+        Scheduler
+        ResultsStore[(Results Memory/DB)]
+        Scheduler <-->|Read/Write| ResultsStore
+    end
+
+    User -->|POST /submit| Scheduler
+    User -->|GET /metrics| Scheduler
+
+    subgraph "Flux Broker Cluster (Persistence Layer)"
+        direction TB
+        BrokerL[Broker Leader]
+        WAL[(WAL Disk)]
+        BrokerF[Broker Follower]
+        
+        BrokerL -->|Persist| WAL
+        BrokerL -.->|Raft Replicate| BrokerF
+    end
+
+    Scheduler -->|PUB jobs.queue| BrokerL
+
+    subgraph "Coordination Layer (Scalable)"
+        BrokerL -->|Load Balanced Queue| Coord1[Coordinator 1]
+        BrokerL -->|Load Balanced Queue| Coord2[Coordinator 2]
+    end
+    
+    subgraph "Worker Swarm (Execution)"
+        Coord1 & Coord2 -->|Least Connections| W1[Worker A]
+        Coord1 & Coord2 -->|Least Connections| W2[Worker B]
+    end
+
+    W1 & W2 -->|Result| BrokerL
+    BrokerL -->|Push Result| Scheduler
+```
+
 ### Message Flow
-```
-User → Scheduler → Broker (jobs.queue)
-                      ↓
-                  Coordinator (smart assignment)
-                      ↓
-                  Broker (worker.{id}.jobs)
-                      ↓
-                  Worker (execute task)
-                      ↓
-                  Broker (jobs.status)
-```
+1. **Submission**: User submits job to Scheduler API. Scheduler persists to Broker (`jobs.queue`).
+2. **Coordination**: Coordinator receives job from Broker (Round-Robin).
+3. **Assignment**: Coordinator selects worker with **Least Active Jobs** (using CPU usage as tie-breaker).
+4. **Execution**: Worker executes payload (Shell/Docker) and reports status back to Broker (`jobs.status`).
+5. **Completion**: Scheduler receives status and updates metrics/history.
 
 ### Broker Channels
 | Channel | Purpose |
