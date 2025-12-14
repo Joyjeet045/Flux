@@ -138,7 +138,7 @@ The heart of Flux is the message broker, which utilizes the **Raft Consensus Alg
 #### 2. The Coordinator (Smart Load Balancer)
 The Coordinator acts as the brain of the distribution layer. Instead of simple Round-Robin or Random dispatch, it implements a **Least Connections** strategy:
 - **Active Job Tracking**: It knows exactly how many jobs each worker is currently processing.
-- **CPU Tie-Breaker**: If two workers have the same job count, it selects the one with the lower CPU utilization (reported via heartbeats).
+- **Random Tie-Breaker**: If two workers have the same job count, one is selected randomly to ensure even distribution.
 - **Push-Based Dispatch**: Jobs are **pushed** to the best worker immediately, minimizing latency compared to worker polling.
 
 #### 3. The Scheduler (API & State)
@@ -157,7 +157,7 @@ The Scheduler provides the user-facing HTTP API (`/submit`, `/metrics`).
 | Channel | Purpose |
 | :--- | :--- |
 | `jobs.queue` | Pending jobs ready for assignment |
-| `worker.heartbeat` | Worker health and CPU status broadcasts |
+| `worker.heartbeat` | Worker active job counts and liveness |
 | `worker.{id}.jobs` | Direct job delivery to specific worker |
 | `jobs.status` | Job execution results and status updates |
 

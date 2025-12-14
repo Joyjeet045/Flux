@@ -229,7 +229,6 @@ func (c *Coordinator) selectBestWorker() string {
 
 	var bestWorker string
 	minActiveJobs := int(^uint(0) >> 1) // Max int
-	minCPU := 1000.0                    // Tie breaker
 
 	now := time.Now().Unix()
 	activeWorkers := 0
@@ -247,18 +246,11 @@ func (c *Coordinator) selectBestWorker() string {
 		if stats.ActiveJobs < minActiveJobs {
 			minActiveJobs = stats.ActiveJobs
 			bestWorker = id
-			minCPU = stats.CPUUsage
-		} else if stats.ActiveJobs == minActiveJobs {
-			// Tie breaker: Least CPU
-			if stats.CPUUsage < minCPU {
-				minCPU = stats.CPUUsage
-				bestWorker = id
-			}
 		}
 	}
 
 	if bestWorker != "" {
-		log.Printf("Selected %s (Jobs: %d, CPU: %.1f%%) from %d active workers", bestWorker, minActiveJobs, minCPU, activeWorkers)
+		log.Printf("Selected %s (Jobs: %d) from %d active workers", bestWorker, minActiveJobs, activeWorkers)
 	} else if activeWorkers == 0 {
 		log.Printf("No active workers available")
 	}

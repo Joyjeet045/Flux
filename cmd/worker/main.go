@@ -21,7 +21,6 @@ import (
 type Worker struct {
 	ID         string
 	conn       net.Conn
-	cpuUsage   float64
 	activeJobs int32 // Atomic counter
 }
 
@@ -39,13 +38,8 @@ func NewWorker(id string, brokerAddr string) (*Worker, error) {
 func (w *Worker) StartHeartbeat() {
 	ticker := time.NewTicker(5 * time.Second)
 	for range ticker.C {
-		// Simulating CPU usage fluctuations
-		w.cpuUsage = 10.0 + rand.Float64()*20.0
-
 		hb := scheduler.WorkerHeartbeat{
 			WorkerID:   w.ID,
-			CPUUsage:   w.cpuUsage,
-			RAMUsage:   512.0, // MB
 			ActiveJobs: int(atomic.LoadInt32(&w.activeJobs)),
 			LastSeen:   time.Now().Unix(),
 		}

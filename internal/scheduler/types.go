@@ -35,8 +35,6 @@ type Job struct {
 // WorkerHeartbeat announces availability.
 type WorkerHeartbeat struct {
 	WorkerID   string   `json:"worker_id"`
-	CPUUsage   float64  `json:"cpu_usage"`
-	RAMUsage   float64  `json:"ram_usage"`
 	ActiveJobs int      `json:"active_jobs"`
 	Tags       []string `json:"tags"`
 	LastSeen   int64    `json:"last_seen"`
