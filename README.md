@@ -73,51 +73,85 @@ Invoke-RestMethod -Uri "http://localhost:8080/submit" -Method Post -Body $body -
 ### Architecture Diagram
 ```mermaid
 graph TD
+    %% -- Client Layer --
     subgraph Clients
-        User[Client / Script]
+        User[Client Script]
     end
 
-    subgraph "Flux Scheduler (API & State)"
+    %% -- Scheduler Layer --
+    subgraph "Flux Scheduler (:8080)"
         Scheduler
-        ResultsStore[(Results Memory/DB)]
-        Scheduler <-->|Read/Write| ResultsStore
+        Results[(Results)]
+        Scheduler <-->|RW| Results
     end
 
-    User -->|POST /submit| Scheduler
-    User -->|GET /metrics| Scheduler
+    User -->|POST| Scheduler
+    User -->|GET| Scheduler
 
-    subgraph "Flux Broker Cluster (Persistence Layer)"
+    %% -- Broker Cluster (Raft) --
+    subgraph "Flux Broker Cluster (:4223)"
         direction TB
-        BrokerL[Broker Leader]
-        WAL[(WAL Disk)]
-        BrokerF[Broker Follower]
+        BrokerL[Leader]
+        WAL[(WAL)]
         
-        BrokerL -->|Persist| WAL
-        BrokerL -.->|Raft Replicate| BrokerF
+        subgraph Followers
+            F1[Replica 1]
+            F2[Replica 2]
+        end
+        
+        BrokerL -->|Log| WAL
+        BrokerL -.->|Raft RPC| F1
+        BrokerL -.->|Raft RPC| F2
     end
 
-    Scheduler -->|PUB jobs.queue| BrokerL
+    Scheduler -->|PUB jobs| BrokerL
 
-    subgraph "Coordination Layer (Scalable)"
-        BrokerL -->|Load Balanced Queue| Coord1[Coordinator 1]
-        BrokerL -->|Load Balanced Queue| Coord2[Coordinator 2]
+    %% -- Coordination --
+    subgraph "Coordination Layer"
+        Coord1[Coordinator 1]
+        Coord2[Coordinator 2]
     end
     
-    subgraph "Worker Swarm (Execution)"
-        Coord1 & Coord2 -->|Least Connections| W1[Worker A]
-        Coord1 & Coord2 -->|Least Connections| W2[Worker B]
+    BrokerL -->|Queue Group| Coord1
+    BrokerL -->|Queue Group| Coord2
+
+    %% -- Execution --
+    subgraph "Worker Swarm"
+        W1[Worker A]
+        W2[Worker B]
     end
 
-    W1 & W2 -->|Result| BrokerL
-    BrokerL -->|Push Result| Scheduler
+    Coord1 & Coord2 -->|Least Conn| W1 & W2
+    W1 & W2 -.->|Heartbeat| Coord1 & Coord2
+    W1 & W2 -->|Status| BrokerL
+    BrokerL -->|Result| Scheduler
 ```
 
+### Component Deep Dive
+
+#### 1. The Broker (Raft & WAL)
+The heart of Flux is the message broker, which utilizes the **Raft Consensus Algorithm** to ensure data consistency across the cluster.
+- **Leader-Follower Model**: All writes go to the Leader, which replicates entries to Followers.
+- **WAL Persistence**: Writes are appended to a segmented **Write-Ahead Log** on disk before being acknowledged, guaranteeing **Zero Data Loss** even if the process crashes.
+- **Quorum Writes**: A message is considered "committed" only when a majority of nodes have persisted it.
+
+#### 2. The Coordinator (Smart Load Balancer)
+The Coordinator acts as the brain of the distribution layer. Instead of simple Round-Robin or Random dispatch, it implements a **Least Connections** strategy:
+- **Active Job Tracking**: It knows exactly how many jobs each worker is currently processing.
+- **CPU Tie-Breaker**: If two workers have the same job count, it selects the one with the lower CPU utilization (reported via heartbeats).
+- **Push-Based Dispatch**: Jobs are **pushed** to the best worker immediately, minimizing latency compared to worker polling.
+
+#### 3. The Scheduler (API & State)
+The Scheduler provides the user-facing HTTP API (`/submit`, `/metrics`).
+- **Idempotency**: It tracks Job IDs to prevent duplicate execution.
+- **Metrics Aggregation**: It listens to the `jobs.status` stream to build real-time performance reports (e.g., success rates, latencies).
+
 ### Message Flow
-1. **Submission**: User submits job to Scheduler API. Scheduler persists to Broker (`jobs.queue`).
-2. **Coordination**: Coordinator receives job from Broker (Round-Robin).
-3. **Assignment**: Coordinator selects worker with **Least Active Jobs** (using CPU usage as tie-breaker).
-4. **Execution**: Worker executes payload (Shell/Docker) and reports status back to Broker (`jobs.status`).
-5. **Completion**: Scheduler receives status and updates metrics/history.
+1. **Submission**: User POSTs job → Scheduler persists to Broker (`jobs.queue`).
+2. **Replication**: Broker Leader replicates to Followers → Writes to Disk (WAL).
+3. **Dispatch**: Coordinator picks up job → Selects best Worker (Least Active Jobs).
+4. **Execution**: Worker runs task → Publishes result to `jobs.status`.
+5. **Ack**: Scheduler receives result → Updates History → User queries `/metrics`.
 
 ### Broker Channels
 | Channel | Purpose |
