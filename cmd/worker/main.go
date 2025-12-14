@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net"
@@ -11,15 +12,17 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"nats-lite/internal/scheduler"
 )
 
 type Worker struct {
-	ID       string
-	conn     net.Conn
-	cpuUsage float64
+	ID         string
+	conn       net.Conn
+	cpuUsage   float64
+	activeJobs int32 // Atomic counter
 }
 
 func NewWorker(id string, brokerAddr string) (*Worker, error) {
@@ -40,10 +43,11 @@ func (w *Worker) StartHeartbeat() {
 		w.cpuUsage = 10.0 + rand.Float64()*20.0
 
 		hb := scheduler.WorkerHeartbeat{
-			WorkerID: w.ID,
-			CPUUsage: w.cpuUsage,
-			RAMUsage: 512.0, // MB
-			LastSeen: time.Now().Unix(),
+			WorkerID:   w.ID,
+			CPUUsage:   w.cpuUsage,
+			RAMUsage:   512.0, // MB
+			ActiveJobs: int(atomic.LoadInt32(&w.activeJobs)),
+			LastSeen:   time.Now().Unix(),
 		}
 
 		data, _ := json.Marshal(hb)
@@ -85,7 +89,7 @@ func (w *Worker) Listen() {
 
 			// Read payload
 			payloadBuf := make([]byte, size)
-			_, err := reader.Read(payloadBuf)
+			_, err := io.ReadFull(reader, payloadBuf)
 			if err != nil {
 				continue
 			}
@@ -99,6 +103,10 @@ func (w *Worker) Listen() {
 }
 
 func (w *Worker) ProcessJob(data []byte, seq string) {
+	// Increment active jobs
+	atomic.AddInt32(&w.activeJobs, 1)
+	defer atomic.AddInt32(&w.activeJobs, -1)
+
 	var job scheduler.Job
 	if err := json.Unmarshal(data, &job); err != nil {
 		log.Println("Invalid job format:", err)
@@ -121,10 +129,11 @@ func (w *Worker) ProcessJob(data []byte, seq string) {
 
 	start := time.Now()
 	result := scheduler.JobResult{
-		JobID:     job.ID,
-		WorkerID:  w.ID,
-		Status:    scheduler.StatusRunning,
-		StartTime: start.Unix(),
+		JobID:       job.ID,
+		WorkerID:    w.ID,
+		Status:      scheduler.StatusRunning,
+		StartTime:   start.Unix(),
+		SubmittedAt: job.CreatedAt,
 	}
 
 	var output string

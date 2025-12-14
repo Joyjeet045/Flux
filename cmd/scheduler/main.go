@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,12 +31,13 @@ type Scheduler struct {
 }
 
 type Metrics struct {
-	JobsTotal     int64
-	JobsCompleted int64
-	JobsFailed    int64
-	JobsPending   int64
-	AvgLatencyMs  int64
-	WorkersActive int
+	JobsTotal         int64
+	JobsCompleted     int64
+	JobsFailed        int64
+	JobsPending       int64
+	AvgLatencyMs      int64
+	WorkersActive     int
+	JobCountsByWorker map[string]int64
 }
 
 func NewScheduler(brokerAddr string) *Scheduler {
@@ -41,7 +46,9 @@ func NewScheduler(brokerAddr string) *Scheduler {
 		brokerAddr: brokerAddr,
 		cronSched:  cron.New(),
 		results:    make(map[string]*scheduler.JobResult),
-		metrics:    &Metrics{},
+		metrics: &Metrics{
+			JobCountsByWorker: make(map[string]int64),
+		},
 	}
 }
 
@@ -51,7 +58,75 @@ func (s *Scheduler) Connect() error {
 		return err
 	}
 	s.conn = conn
+
+	// Subscribe to job status updates
+	subCmd := "SUB jobs.status 1\r\n"
+	if _, err := conn.Write([]byte(subCmd)); err != nil {
+		return err
+	}
+
+	// Start listener for job results
+	go s.listenForResults()
+
 	return nil
+}
+
+func (s *Scheduler) listenForResults() {
+	reader := bufio.NewReader(s.conn)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			log.Printf("Result listener error: %v", err)
+			return
+		}
+
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "MSG") {
+			// Parse: MSG jobs.status 1 <size> <seq>
+			parts := strings.Split(line, " ")
+			if len(parts) < 5 {
+				continue
+			}
+
+			seq := parts[4]
+			size, _ := strconv.Atoi(parts[3])
+			payload := make([]byte, size)
+			io.ReadFull(reader, payload)
+			reader.ReadString('\n') // Trailing \r\n
+
+			// Send ACK immediately
+			ackCmd := fmt.Sprintf("ACK %s\r\n", seq)
+			s.conn.Write([]byte(ackCmd))
+
+			// Parse job result
+			var result scheduler.JobResult
+			if err := json.Unmarshal(payload, &result); err == nil {
+				s.resultsMu.Lock()
+				existing, exists := s.results[result.JobID]
+				shouldCount := !exists || (existing.Status != "COMPLETED" && existing.Status != "FAILED")
+
+				s.results[result.JobID] = &result
+				s.resultsMu.Unlock()
+
+				// Update metrics
+				if shouldCount {
+					s.metricsMu.Lock()
+					if result.Status == "COMPLETED" {
+						s.metrics.JobsCompleted++
+						// Track by worker
+						if result.WorkerID != "" {
+							s.metrics.JobCountsByWorker[result.WorkerID]++
+						} else {
+							s.metrics.JobCountsByWorker["unknown"]++
+						}
+					} else if result.Status == "FAILED" {
+						s.metrics.JobsFailed++
+					}
+					s.metricsMu.Unlock()
+				}
+			}
+		}
+	}
 }
 
 func (s *Scheduler) SubmitHandler(w http.ResponseWriter, r *http.Request) {
@@ -211,6 +286,17 @@ func (s *Scheduler) MetricsHandler(w http.ResponseWriter, r *http.Request) {
 	s.metricsMu.RLock()
 	s.mu.RLock()
 
+	// Deep copy map to prevent concurrent read/write during JSON encode outside lock
+	workerCounts := make(map[string]int64)
+	jobHistory := make([]*scheduler.JobResult, 0, len(s.results))
+
+	for k, v := range s.metrics.JobCountsByWorker {
+		workerCounts[k] = v
+	}
+	for _, result := range s.results {
+		jobHistory = append(jobHistory, result)
+	}
+
 	metrics := map[string]interface{}{
 		"jobs_total":     s.metrics.JobsTotal,
 		"jobs_completed": s.metrics.JobsCompleted,
@@ -219,6 +305,8 @@ func (s *Scheduler) MetricsHandler(w http.ResponseWriter, r *http.Request) {
 		"avg_latency_ms": s.metrics.AvgLatencyMs,
 		"success_rate":   float64(s.metrics.JobsCompleted) / float64(s.metrics.JobsTotal) * 100,
 		"results_stored": len(s.results),
+		"jobs_by_worker": workerCounts,
+		"job_history":    jobHistory,
 	}
 
 	s.mu.RUnlock()

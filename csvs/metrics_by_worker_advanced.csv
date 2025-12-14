@@ -1,0 +1,5 @@
+"WorkerID","JobsCompleted","Timestamp"
+"worker-A","22","2025-12-14 10:12:43"
+"worker-B-recovered","6","2025-12-14 10:12:43"
+"worker-C","16","2025-12-14 10:12:43"
+"worker-D","1","2025-12-14 10:12:43"

@@ -146,10 +146,16 @@ func New(cfg *config.Config) (*Server, error) {
 		clusterMgr.SetOnApply(func(cmd *internalraft.LogCommand, seq uint64) {
 			log.Printf("FSM OnApply [Node %s]: Type=%s Subject=%s Seq=%d", cfg.Cluster.NodeID, cmd.Type, cmd.Subject, seq)
 			if cmd.Type == internalraft.CmdPublish {
-				// subs := srv.matcher.Match(cmd.Subject)
-				// log.Printf("Cluster Apply [Node %s]: %s (Seq %d)", cfg.Cluster.NodeID, cmd.Subject, seq)
 				subs := srv.matcher.Match(cmd.Subject)
 				log.Printf("Matched %d subs for %s", len(subs), cmd.Subject)
+
+				// Only route to local subscribers if we are the leader
+				// Followers just apply to local store for replication
+				if !clusterMgr.IsLeader() {
+					log.Printf("DEBUG:  Follower node - skipping local routing")
+					return
+				}
+
 				for _, sub := range subs {
 					srv.ack.Track(seq, sub.Client, sub.Sid, cmd.Subject, cmd.Data)
 					sub.Client.Send(sub.Sid, cmd.Subject, cmd.Data, seq)

@@ -128,6 +128,10 @@ func (c *Coordinator) Listen() {
 			} else if subject == "jobs.queue" {
 				c.handleJob(payloadBuf)
 			} else if strings.HasPrefix(subject, "DLQ.") {
+				// Ignore DLQ messages from status updates (scheduler metrics)
+				if strings.Contains(subject, "jobs.status") {
+					continue
+				}
 				log.Printf("⚠️ RECOVERING FAILED JOB from %s", subject)
 
 				// CRITICAL: Parse failed worker ID and remove it immediately
@@ -224,7 +228,9 @@ func (c *Coordinator) selectBestWorker() string {
 	defer c.mu.RUnlock()
 
 	var bestWorker string
-	minCPU := 1000.0
+	minActiveJobs := int(^uint(0) >> 1) // Max int
+	minCPU := 1000.0                    // Tie breaker
+
 	now := time.Now().Unix()
 	activeWorkers := 0
 
@@ -236,14 +242,23 @@ func (c *Coordinator) selectBestWorker() string {
 		}
 
 		activeWorkers++
-		if stats.CPUUsage < minCPU {
-			minCPU = stats.CPUUsage
+
+		// LEAST CONNECTIONS STRATEGY
+		if stats.ActiveJobs < minActiveJobs {
+			minActiveJobs = stats.ActiveJobs
 			bestWorker = id
+			minCPU = stats.CPUUsage
+		} else if stats.ActiveJobs == minActiveJobs {
+			// Tie breaker: Least CPU
+			if stats.CPUUsage < minCPU {
+				minCPU = stats.CPUUsage
+				bestWorker = id
+			}
 		}
 	}
 
 	if bestWorker != "" {
-		log.Printf("Selected %s (CPU: %.1f%%) from %d active workers", bestWorker, minCPU, activeWorkers)
+		log.Printf("Selected %s (Jobs: %d, CPU: %.1f%%) from %d active workers", bestWorker, minActiveJobs, minCPU, activeWorkers)
 	} else if activeWorkers == 0 {
 		log.Printf("No active workers available")
 	}

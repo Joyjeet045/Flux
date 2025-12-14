@@ -63,7 +63,7 @@ for ($i = 1; $i -le 20; $i = $i + 1) {
     } catch {
         Write-Host "  Job $i failed: $_" -ForegroundColor Red
     }
-    Start-Sleep -Milliseconds 100
+    Start-Sleep -Milliseconds 200
 }
 
 Write-Host "  Total submitted: $jobCount jobs" -ForegroundColor Green
@@ -106,7 +106,7 @@ for ($i = 21; $i -le 30; $i = $i + 1) {
     } catch {
         Write-Host "  Job $i failed: $_" -ForegroundColor Red
     }
-    Start-Sleep -Milliseconds 150
+    Start-Sleep -Milliseconds 300
 }
 
 Write-Host "  Expected: Jobs distributed across 4 workers" -ForegroundColor Gray
@@ -142,7 +142,7 @@ for ($i = 31; $i -le 45; $i = $i + 1) {
     } catch {
         Write-Host "  Job $i failed" -ForegroundColor Red
     }
-    Start-Sleep -Milliseconds 50
+    Start-Sleep -Milliseconds 200
 }
 
 Write-Host "  All jobs submitted!" -ForegroundColor Green
@@ -165,6 +165,52 @@ Write-Host "    - Jobs distributed based on CPU load" -ForegroundColor Gray
 Write-Host "`n  Scheduler:" -ForegroundColor White
 Write-Host "    - All 45 jobs accepted and scheduled" -ForegroundColor Gray
 Write-Host "    - Delayed jobs executed after timer" -ForegroundColor Gray
+
+
+Write-Host "`n=== METRICS COLLECTION ===" -ForegroundColor Magenta
+Write-Host "Waiting 3 seconds for all jobs to finish..." -ForegroundColor Gray
+Start-Sleep -Seconds 3
+
+try {
+    $metrics = Invoke-RestMethod -Uri "http://localhost:8080/metrics" -Method Get
+    
+    # Save Summary CSV
+    $csvSummaryPath = "metrics_by_worker_advanced.csv"
+    $workerMetrics = @()
+    if ($metrics.jobs_by_worker) {
+        $metrics.jobs_by_worker | Get-Member -MemberType NoteProperty | ForEach-Object {
+            $workerID = $_.Name
+            $count = $metrics.jobs_by_worker.$workerID
+            $workerMetrics += [PSCustomObject]@{
+                WorkerID = $workerID
+                JobsCompleted = $count
+                Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+            }
+        }
+    }
+    $workerMetrics | Export-Csv -Path $csvSummaryPath -NoTypeInformation
+    
+    # Process Detailed History
+    $historyCsvPath = "job_history_advanced.csv"
+    $historyData = @()
+    if ($metrics.job_history) {
+        $metrics.job_history | ForEach-Object {
+            $historyData += [PSCustomObject]@{
+                JobID = $_.job_id
+                WorkerID = $_.worker_id
+                SubmittedTime = (Get-Date -Date "1970-01-01 00:00:00Z").AddSeconds($_.submitted_at).ToLocalTime().ToString("HH:mm:ss")
+                CompletionTime = (Get-Date -Date "1970-01-01 00:00:00Z").AddSeconds($_.end_time).ToLocalTime().ToString("HH:mm:ss")
+                DurationMS = $_.duration_ms
+            }
+        }
+        $historyData | Sort-Object SubmittedTime | Export-Csv -Path $historyCsvPath -NoTypeInformation
+        Write-Host "Detailed job history saved to $historyCsvPath" -ForegroundColor Yellow
+    }
+
+    Write-Host "Metrics saved to $csvSummaryPath" -ForegroundColor Yellow
+} catch {
+    Write-Host "Failed to fetch metrics: $_" -ForegroundColor Red
+}
 
 Write-Host "`n`n=== Observation Period ===" -ForegroundColor Green
 Write-Host "System running with 4 workers + 2 coordinators" -ForegroundColor Yellow
